@@ -1,0 +1,29 @@
+diff --git a/src/Mgr/Item/LootObjectStack.cpp b/src/Mgr/Item/LootObjectStack.cpp
+index e5ba8719..9ae73519 100644
+--- a/src/Mgr/Item/LootObjectStack.cpp
++++ b/src/Mgr/Item/LootObjectStack.cpp
+@@ -65,7 +65,8 @@ void LootObject::Refresh(Player* bot, ObjectGuid lootGUID)
+     Creature* creature = botAI->GetCreature(lootGUID);
+     if (creature && creature->getDeathState() == DeathState::Corpse)
+     {
+-        if (creature->HasFlag(UNIT_DYNAMIC_FLAGS, UNIT_DYNFLAG_LOOTABLE))
++        if (creature->HasFlag(UNIT_DYNAMIC_FLAGS, UNIT_DYNFLAG_LOOTABLE) &&
++            (!creature->loot.HasPersonalLoot() || bot->isAllowedToLoot(creature)))
+             guid = lootGUID;
+ 
+         if (creature->HasFlag(UNIT_FIELD_FLAGS, UNIT_FLAG_SKINNABLE))
+@@ -81,6 +82,14 @@ void LootObject::Refresh(Player* bot, ObjectGuid lootGUID)
+     }
+ 
+     GameObject* go = botAI->GetGameObject(lootGUID);
++    if (go && go->loot.HasPersonalLoot())
++    {
++        Loot const* result = go->loot.GetPersonalLoot(bot->GetGUID());
++        if (go->isSpawned() && go->IsLootAllowedFor(bot) && result &&
++            (go->loot.gold != 0 || !result->isLooted()))
++            guid = lootGUID;
++        return;
++    }
+     if (go && go->isSpawned() && go->GetGoState() == GO_STATE_READY)
+     {
+         bool onlyHasQuestItems = true;

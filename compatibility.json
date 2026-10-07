@@ -1,0 +1,16 @@
+{
+  "version": "0.1.0",
+  "status": "experimental",
+  "core": {
+    "repository": "https://github.com/mod-playerbots/azerothcore-wotlk.git",
+    "commit": "7f12e89ee5f467a50e62eba1d525eac7dc953d03",
+    "patch": "patches/azerothcore-personal-loot.patch",
+    "sha256": "ae04e6443146113b337d9cdddd609e7e87df329da0c2a344d4fb84f048a4de65"
+  },
+  "playerbots": {
+    "repository": "https://github.com/mod-playerbots/mod-playerbots.git",
+    "commit": "7bae1b5c58c76a0aa20381155edc08096d1485b2",
+    "patch": "patches/playerbots-personal-loot.patch",
+    "sha256": "86e0a5c59c2a6bd453214c4581a8a2df259482c84729a05a17db7ec7aa6b71a4"
+  }
+}

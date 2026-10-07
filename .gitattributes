@@ -1,0 +1,3 @@
+* text=auto eol=lf
+# Unified patches require a space prefix on empty context lines.
+*.patch -whitespace

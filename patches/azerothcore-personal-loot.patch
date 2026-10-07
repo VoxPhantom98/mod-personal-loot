@@ -1,0 +1,2493 @@
+diff --git a/src/server/database/Database/DatabaseWorkerPool.cpp b/src/server/database/Database/DatabaseWorkerPool.cpp
+index c57a65b97..b6cd50b6d 100644
+--- a/src/server/database/Database/DatabaseWorkerPool.cpp
++++ b/src/server/database/Database/DatabaseWorkerPool.cpp
+@@ -335,12 +335,36 @@ void DatabaseWorkerPool<T>::DirectCommitTransaction(SQLTransaction<T>& transacti
+     connection->Unlock();
+ }
+ 
++template <class T>
++TransactionOutcome DatabaseWorkerPool<T>::DirectCommitCheckedTransaction(SQLTransaction<T> const& transaction)
++{
++    if (!transaction || transaction->GetSize() == 0)
++        return TransactionOutcome::Unknown;
++
++    T* connection = GetFreeConnection();
++    TransactionOutcome outcome = connection->ExecuteCheckedTransaction(transaction);
++    transaction->Cleanup();
++    connection->Unlock();
++    return outcome;
++}
++
+ template <class T>
+ PreparedStatement<T>* DatabaseWorkerPool<T>::GetPreparedStatement(PreparedStatementIndex index)
+ {
+     return new PreparedStatement<T>(index, _preparedStatementSize[index]);
+ }
+ 
++template <class T>
++TransactionOutcome DatabaseWorkerPool<T>::OrderedCommitCheckedTransaction(SQLTransaction<T> const& transaction)
++{
++    if (!transaction || transaction->GetSize() == 0 || !HasSingleAsyncWorker())
++        return TransactionOutcome::Unknown;
++    auto task = new CheckedTransactionTask(transaction);
++    auto result = task->GetFuture();
++    Enqueue(task);
++    return result.get();
++}
++
+ template <class T>
+ void DatabaseWorkerPool<T>::EscapeString(std::string& str)
+ {
+diff --git a/src/server/database/Database/DatabaseWorkerPool.h b/src/server/database/Database/DatabaseWorkerPool.h
+index d9b418b1b..85a8ae40c 100644
+--- a/src/server/database/Database/DatabaseWorkerPool.h
++++ b/src/server/database/Database/DatabaseWorkerPool.h
+@@ -19,6 +19,7 @@
+ #define _DATABASEWORKERPOOL_H
+ 
+ #include "DatabaseEnvFwd.h"
++#include "CheckedTransaction.h"
+ #include "Define.h"
+ #include "StringFormat.h"
+ #include <array>
+@@ -180,6 +181,11 @@ public:
+     //! Directly executes a collection of one-way SQL operations (can be both adhoc and prepared). The order in which these operations
+     //! were appended to the transaction will be respected during execution.
+     void DirectCommitTransaction(SQLTransaction<T>& transaction);
++    //! InnoDB DML only; no replay. Unknown requires durable-ID reconciliation.
++    TransactionOutcome DirectCommitCheckedTransaction(SQLTransaction<T> const& transaction);
++    // FIFO fence for character claims; requires exactly one async connection.
++    TransactionOutcome OrderedCommitCheckedTransaction(SQLTransaction<T> const& transaction);
++    [[nodiscard]] bool HasSingleAsyncWorker() const { return _async_threads == 1; }
+ 
+     //! Method used to execute ad-hoc statements in a diverse context.
+     //! Will be wrapped in a transaction if valid object is present, otherwise executed standalone.
+diff --git a/src/server/database/Database/Implementation/CharacterDatabase.cpp b/src/server/database/Database/Implementation/CharacterDatabase.cpp
+index b262b946b..3e300a2c9 100644
+--- a/src/server/database/Database/Implementation/CharacterDatabase.cpp
++++ b/src/server/database/Database/Implementation/CharacterDatabase.cpp
+@@ -16,6 +16,7 @@
+  */
+ 
+ #include "CharacterDatabase.h"
++#include "Config.h"
+ #include "MySQLPreparedStatement.h"
+ 
+ void CharacterDatabaseConnection::DoPrepareStatements()
+@@ -23,6 +24,109 @@ void CharacterDatabaseConnection::DoPrepareStatements()
+     if (!m_reconnecting)
+         m_stmts.resize(MAX_CHARACTERDATABASE_STATEMENTS);
+ 
++    // The core result reader supports text fields, but not native MYSQL_TYPE_JSON.
++    // Cast journal JSON to text on reads; the schema must exist before enabling.
++    if (sConfigMgr->GetOption<bool>("PersonalLoot.GenerationJournal", false))
++    {
++        PrepareStatement(CHAR_PL_INS_EVENT,
++            "INSERT INTO personal_loot_event (event_id,source_key,source_kind,source_entry,source_spawn_id,"
++            "map_id,instance_id,difficulty,loot_mode,state,created_at) "
++            "VALUES (UNHEX(?),?,?,?,?,?,?,?,?,0,?)", CONNECTION_SYNCH);
++        PrepareStatement(CHAR_PL_INS_RECIPIENT,
++            "INSERT INTO personal_loot_recipient VALUES (UNHEX(?),?,?,?,?)", CONNECTION_SYNCH);
++        PrepareStatement(CHAR_PL_INS_REWARD,
++            "INSERT INTO personal_loot_reward VALUES (UNHEX(?),?,?,?,?,?,?,?,?,?)", CONNECTION_SYNCH);
++        PrepareStatement(CHAR_PL_INS_SNAPSHOT,
++            "INSERT INTO personal_loot_snapshot VALUES (UNHEX(?),1,?)", CONNECTION_SYNCH);
++        PrepareStatement(CHAR_PL_SEL_SNAPSHOT,
++            "SELECT HEX(e.event_id),s.format_version,CAST(s.payload AS CHAR CHARACTER SET utf8mb4) "
++            "FROM personal_loot_event e "
++            "JOIN personal_loot_snapshot s ON s.event_id=e.event_id "
++            "WHERE e.source_key=? AND e.state IN (1,2)", CONNECTION_SYNCH);
++        PrepareStatement(CHAR_PL_MARK_READY,
++            "UPDATE personal_loot_event SET state=1,ready_at=? WHERE event_id=UNHEX(?) AND state=0",
++            CONNECTION_SYNCH);
++        PrepareStatement(CHAR_PL_REP_INSTANCE_CYCLE,
++            "REPLACE INTO personal_loot_instance_cycle VALUES (?,UNHEX(?),?,?)", CONNECTION_SYNCH);
++        PrepareStatement(CHAR_PL_INS_INSTANCE_CYCLE,
++            "INSERT IGNORE INTO personal_loot_instance_cycle VALUES (?,UNHEX(?),?,?)", CONNECTION_SYNCH);
++        PrepareStatement(CHAR_PL_SEL_INSTANCE_CYCLE,
++            "SELECT HEX(cycle_id),map_id,difficulty FROM personal_loot_instance_cycle WHERE instance_id=?",
++            CONNECTION_SYNCH);
++        PrepareStatement(CHAR_PL_INS_CLAIM,
++            "INSERT INTO personal_loot_claim SELECT pr.event_id,pr.character_guid,?,?,UNHEX(?),?,? "
++            "FROM personal_loot_recipient pr JOIN characters p ON p.guid=pr.character_guid "
++            "AND p.account=pr.account_id WHERE pr.event_id=UNHEX(?) AND pr.character_guid=? "
++            "AND CAST(JSON_UNQUOTE(JSON_EXTRACT(pr.eligibility_snapshot,'$.characterCreatedAt')) AS UNSIGNED) "
++            "=UNIX_TIMESTAMP(p.creation_date) "
++            "AND EXISTS(SELECT 1 FROM personal_loot_reward r WHERE r.event_id=pr.event_id "
++            "AND r.character_guid=pr.character_guid AND r.reward_index=? AND r.quantity>0)", CONNECTION_BOTH);
++        PrepareStatement(CHAR_PL_SEL_CLAIMS,
++            "SELECT character_guid,reward_index FROM personal_loot_claim WHERE event_id=UNHEX(?) "
++            "UNION ALL SELECT 0,0 FROM personal_loot_event WHERE event_id=UNHEX(?) AND state IN (1,2)",
++            CONNECTION_SYNCH);
++        PrepareStatement(CHAR_PL_UPD_STACK,
++            "UPDATE item_instance SET count=count+?,flags=? WHERE guid=? AND owner_guid=? AND count=?",
++            CONNECTION_BOTH);
++        PrepareStatement(CHAR_PL_UPD_GOLD,
++            "UPDATE characters SET money=money+? WHERE guid=? AND money=?", CONNECTION_BOTH);
++        PrepareStatement(CHAR_PL_INS_INVENTORY,
++            "INSERT INTO character_inventory (guid,bag,slot,item) SELECT ?,?,?,? WHERE NOT EXISTS "
++            "(SELECT 1 FROM character_inventory WHERE guid=? AND bag=? AND slot=?)", CONNECTION_BOTH);
++        PrepareStatement(CHAR_PL_INS_ITEM_INSTANCE,
++            "INSERT INTO item_instance (itemEntry,owner_guid,creatorGuid,giftCreatorGuid,count,duration,charges,"
++            "flags,enchantments,randomPropertyId,durability,playedTime,text,guid) "
++            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", CONNECTION_BOTH);
++        PrepareStatement(CHAR_PL_MARK_ORPHAN,
++            "UPDATE personal_loot_event SET state=2 WHERE event_id=UNHEX(?) AND state=1", CONNECTION_ASYNC);
++        PrepareStatement(CHAR_PL_ORPHAN_ALL,
++            "UPDATE personal_loot_event SET state=2 WHERE state=1", CONNECTION_BOTH);
++        std::string pending =
++            "SELECT HEX(r.event_id),r.character_guid,r.reward_index,r.reward_kind,r.item_entry,r.quantity,"
++            "r.random_property,r.random_suffix,r.item_flags,"
++            "CAST(r.eligibility_metadata AS CHAR CHARACTER SET utf8mb4),p.playerFlags,e.map_id,e.instance_id "
++            "FROM personal_loot_reward r JOIN personal_loot_event e ON e.event_id=r.event_id "
++            "JOIN characters p ON p.guid=r.character_guid "
++            "JOIN personal_loot_recipient pr ON pr.event_id=r.event_id AND pr.character_guid=r.character_guid "
++            "AND pr.account_id=p.account "
++            "AND CAST(JSON_UNQUOTE(JSON_EXTRACT(pr.eligibility_snapshot,'$.characterCreatedAt')) AS UNSIGNED) "
++            "=UNIX_TIMESTAMP(p.creation_date) "
++            "LEFT JOIN personal_loot_claim c ON c.event_id=r.event_id AND c.character_guid=r.character_guid "
++            "AND c.reward_index=r.reward_index WHERE e.state=2 AND c.event_id IS NULL AND r.quantity>0 ";
++        PrepareStatement(CHAR_PL_SEL_PENDING, pending +
++            "AND (r.event_id,r.character_guid,r.reward_index)>(UNHEX(?),?,?) "
++            "ORDER BY r.event_id,r.character_guid,r.reward_index LIMIT 200", CONNECTION_SYNCH);
++        PrepareStatement(CHAR_PL_SEL_PENDING_PLAYER, pending +
++            "AND r.character_guid=? AND (r.event_id,r.reward_index)>(UNHEX(?),?) "
++            "ORDER BY r.event_id,r.reward_index LIMIT 48", CONNECTION_SYNCH);
++        PrepareStatement(CHAR_PL_INS_DELIVERY,
++            "INSERT INTO personal_loot_mail_delivery VALUES (UNHEX(?),?,1,?,?,?)", CONNECTION_BOTH);
++        PrepareStatement(CHAR_PL_SEL_RECOVERY_MAIL,
++            "SELECT m.id,m.messageType,m.sender,m.receiver,m.subject,m.body,m.expire_time,m.deliver_time,"
++            "m.money,m.cod,m.checked,m.stationery,m.mailTemplateId,m.has_items FROM mail m "
++            "JOIN personal_loot_mail_delivery d ON d.mail_id=m.id WHERE m.receiver=?", CONNECTION_SYNCH);
++        PrepareStatement(CHAR_PL_SEL_RECOVERY_ITEMS,
++            "SELECT creatorGuid,giftCreatorGuid,count,duration,charges,flags,enchantments,randomPropertyId,"
++            "durability,playedTime,text,mi.item_guid,ii.itemEntry FROM mail_items mi "
++            "JOIN item_instance ii ON ii.guid=mi.item_guid WHERE mi.mail_id=? AND mi.receiver=?",
++            CONNECTION_SYNCH);
++        PrepareStatement(CHAR_PL_SEL_OWNED_COUNTS,
++            "SELECT CAST(itemEntry AS UNSIGNED),CAST(SUM(count) AS UNSIGNED) "
++            "FROM item_instance WHERE owner_guid=? GROUP BY itemEntry "
++            "UNION ALL SELECT CAST(0 AS UNSIGNED),CAST(0 AS UNSIGNED)",
++            CONNECTION_SYNCH);
++        PrepareStatement(CHAR_PL_MAIL_STATUS,
++            "SELECT EXISTS(SELECT 1 FROM personal_loot_mail_delivery WHERE mail_id=? AND character_guid=?)",
++            CONNECTION_SYNCH);
++        PrepareStatement(CHAR_PL_DEL_MAIL_ITEM,
++            "DELETE FROM mail_items WHERE mail_id=? AND item_guid=? AND receiver=?", CONNECTION_BOTH);
++        PrepareStatement(CHAR_PL_CLEAR_MAIL_GOLD,
++            "UPDATE mail SET money=0 WHERE id=? AND receiver=? AND money=?", CONNECTION_BOTH);
++        PrepareStatement(CHAR_PL_UPD_MAIL_ITEMS,
++            "UPDATE mail SET has_items=EXISTS(SELECT 1 FROM mail_items WHERE mail_id=?) WHERE id=? AND receiver=?",
++            CONNECTION_BOTH);
++    }
++
+     PrepareStatement(CHAR_DEL_QUEST_POOL_SAVE, "DELETE FROM pool_quest_save WHERE pool_id = ?", CONNECTION_ASYNC);
+     PrepareStatement(CHAR_INS_QUEST_POOL_SAVE, "INSERT INTO pool_quest_save (pool_id, quest_id) VALUES (?, ?)", CONNECTION_ASYNC);
+     PrepareStatement(CHAR_DEL_NONEXISTENT_GUILD_BANK_ITEM, "DELETE FROM guild_bank_item WHERE guildid = ? AND TabId = ? AND SlotId = ?", CONNECTION_ASYNC);
+diff --git a/src/server/database/Database/Implementation/CharacterDatabase.h b/src/server/database/Database/Implementation/CharacterDatabase.h
+index 441147e57..46135bca5 100644
+--- a/src/server/database/Database/Implementation/CharacterDatabase.h
++++ b/src/server/database/Database/Implementation/CharacterDatabase.h
+@@ -547,6 +547,33 @@ enum CharacterDatabaseStatements : uint32
+     CHAR_REP_WORLD_STATE,
+ 
+     CHAR_NO_OP_PROVIDE_REALM_CONTEXT,
++    CHAR_PL_INS_EVENT,
++    CHAR_PL_INS_RECIPIENT,
++    CHAR_PL_INS_REWARD,
++    CHAR_PL_INS_SNAPSHOT,
++    CHAR_PL_SEL_SNAPSHOT,
++    CHAR_PL_MARK_READY,
++    CHAR_PL_REP_INSTANCE_CYCLE,
++    CHAR_PL_INS_INSTANCE_CYCLE,
++    CHAR_PL_SEL_INSTANCE_CYCLE,
++    CHAR_PL_INS_CLAIM,
++    CHAR_PL_SEL_CLAIMS,
++    CHAR_PL_UPD_STACK,
++    CHAR_PL_UPD_GOLD,
++    CHAR_PL_INS_INVENTORY,
++    CHAR_PL_INS_ITEM_INSTANCE,
++    CHAR_PL_MARK_ORPHAN,
++    CHAR_PL_ORPHAN_ALL,
++    CHAR_PL_SEL_PENDING,
++    CHAR_PL_SEL_PENDING_PLAYER,
++    CHAR_PL_INS_DELIVERY,
++    CHAR_PL_SEL_RECOVERY_MAIL,
++    CHAR_PL_SEL_RECOVERY_ITEMS,
++    CHAR_PL_SEL_OWNED_COUNTS,
++    CHAR_PL_MAIL_STATUS,
++    CHAR_PL_DEL_MAIL_ITEM,
++    CHAR_PL_CLEAR_MAIL_GOLD,
++    CHAR_PL_UPD_MAIL_ITEMS,
+ 
+     MAX_CHARACTERDATABASE_STATEMENTS
+ };
+diff --git a/src/server/database/Database/MySQLConnection.cpp b/src/server/database/Database/MySQLConnection.cpp
+index b62d0ed82..71cb745f0 100644
+--- a/src/server/database/Database/MySQLConnection.cpp
++++ b/src/server/database/Database/MySQLConnection.cpp
+@@ -187,7 +187,7 @@ bool MySQLConnection::Execute(std::string_view sql)
+             LOG_INFO("sql.sql", "SQL: {}", sql);
+             LOG_ERROR("sql.sql", "[{}] {}", lErrno, mysql_error(m_Mysql));
+ 
+-            if (_HandleMySQLErrno(lErrno, mysql_error(m_Mysql)))  // If it returns true, an error was handled successfully (i.e. reconnection)
++            if (!m_checkedTransaction && _HandleMySQLErrno(lErrno, mysql_error(m_Mysql)))
+                 return Execute(sql);       // Try again
+ 
+             return false;
+@@ -225,7 +225,7 @@ bool MySQLConnection::Execute(PreparedStatementBase* stmt)
+         uint32 lErrno = mysql_errno(m_Mysql);
+         LOG_ERROR("sql.sql", "SQL(p): {}\n [ERROR]: [{}] {}", m_mStmt->getQueryString(), lErrno, mysql_stmt_error(msql_STMT));
+ 
+-        if (_HandleMySQLErrno(lErrno, mysql_stmt_error(msql_STMT)))  // If it returns true, an error was handled successfully (i.e. reconnection)
++        if (!m_checkedTransaction && _HandleMySQLErrno(lErrno, mysql_stmt_error(msql_STMT)))
+             return Execute(stmt);       // Try again
+ 
+         m_mStmt->ClearParameters();
+@@ -237,7 +237,7 @@ bool MySQLConnection::Execute(PreparedStatementBase* stmt)
+         uint32 lErrno = mysql_errno(m_Mysql);
+         LOG_ERROR("sql.sql", "SQL(p): {}\n [ERROR]: [{}] {}", m_mStmt->getQueryString(), lErrno, mysql_stmt_error(msql_STMT));
+ 
+-        if (_HandleMySQLErrno(lErrno, mysql_stmt_error(msql_STMT)))  // If it returns true, an error was handled successfully (i.e. reconnection)
++        if (!m_checkedTransaction && _HandleMySQLErrno(lErrno, mysql_stmt_error(msql_STMT)))
+             return Execute(stmt);       // Try again
+ 
+         m_mStmt->ClearParameters();
+@@ -453,6 +453,44 @@ int MySQLConnection::ExecuteTransaction(std::shared_ptr<TransactionBase> transac
+     return 0;
+ }
+ 
++TransactionOutcome MySQLConnection::ExecuteCheckedTransaction(
++    std::shared_ptr<TransactionBase> const& transaction)
++{
++    if (!transaction || transaction->m_queries.empty() || m_checkedTransaction)
++        return TransactionOutcome::Unknown;
++
++    struct ReplayGuard
++    {
++        bool& checked;
++        explicit ReplayGuard(bool& value) : checked(value) { checked = true; }
++        ~ReplayGuard() { checked = false; }
++    } guard(m_checkedTransaction);
++
++    return RunCheckedTransaction([this](std::string_view command) { return Execute(command); }, [&]()
++    {
++        for (std::size_t index = 0; index < transaction->m_queries.size(); ++index)
++        {
++            auto const& data = transaction->m_queries[index];
++            bool executed = data.type == SQL_ELEMENT_PREPARED ?
++                Execute(std::get<PreparedStatementBase*>(data.element)) :
++                Execute(std::get<std::string>(data.element));
++            if (!executed)
++                return false;
++            if (auto expected = transaction->m_requiredAffectedRows.find(index);
++                expected != transaction->m_requiredAffectedRows.end())
++            {
++                uint64 affected = data.type == SQL_ELEMENT_PREPARED ?
++                    mysql_stmt_affected_rows(GetPreparedStatement(
++                        std::get<PreparedStatementBase*>(data.element)->GetIndex())->GetSTMT()) :
++                    mysql_affected_rows(m_Mysql);
++                if (affected != expected->second)
++                    return false;
++            }
++        }
++        return true;
++    });
++}
++
+ std::size_t MySQLConnection::EscapeString(char* to, char const* from, std::size_t length)
+ {
+     return mysql_real_escape_string(m_Mysql, to, from, length);
+diff --git a/src/server/database/Database/MySQLConnection.h b/src/server/database/Database/MySQLConnection.h
+index 4fe8eec27..db1ac4029 100644
+--- a/src/server/database/Database/MySQLConnection.h
++++ b/src/server/database/Database/MySQLConnection.h
+@@ -19,6 +19,7 @@
+ #define _MYSQLCONNECTION_H
+ 
+ #include "DatabaseEnvFwd.h"
++#include "CheckedTransaction.h"
+ #include "Define.h"
+ #include <map>
+ #include <mutex>
+@@ -80,6 +81,7 @@ public:
+     void RollbackTransaction();
+     void CommitTransaction();
+     int ExecuteTransaction(std::shared_ptr<TransactionBase> transaction);
++    TransactionOutcome ExecuteCheckedTransaction(std::shared_ptr<TransactionBase> const& transaction);
+     std::size_t EscapeString(char* to, char const* from, std::size_t length);
+     void Ping();
+ 
+@@ -106,6 +108,7 @@ protected:
+     PreparedStatementContainer m_stmts; //! PreparedStatements storage
+     bool m_reconnecting;  //! Are we reconnecting?
+     bool m_prepareError;  //! Was there any error while preparing statements?
++    bool m_checkedTransaction{false};
+     MySQLHandle* m_Mysql; //! MySQL Handle.
+ 
+ private:
+diff --git a/src/server/database/Database/Transaction.cpp b/src/server/database/Database/Transaction.cpp
+index dba55aefe..b1ea3e7d3 100644
+--- a/src/server/database/Database/Transaction.cpp
++++ b/src/server/database/Database/Transaction.cpp
+@@ -189,3 +189,10 @@ bool TransactionCallback::InvokeIfReady()
+ 
+     return false;
+ }
++
++bool CheckedTransactionTask::Execute()
++{
++    TransactionOutcome outcome = m_conn->ExecuteCheckedTransaction(m_trans);
++    m_result.set_value(outcome);
++    return outcome == TransactionOutcome::Committed;
++}
+diff --git a/src/server/database/Database/Transaction.h b/src/server/database/Database/Transaction.h
+index 5e6f350fe..340d9b708 100644
+--- a/src/server/database/Database/Transaction.h
++++ b/src/server/database/Database/Transaction.h
+@@ -19,11 +19,13 @@
+ #define _TRANSACTION_H
+ 
+ #include "DatabaseEnvFwd.h"
++#include "CheckedTransaction.h"
+ #include "Define.h"
+ #include "SQLOperation.h"
+ #include "StringFormat.h"
+ #include <functional>
+ #include <mutex>
++#include <map>
+ #include <vector>
+ 
+ /*! Transactions, high level class. */
+@@ -49,11 +51,13 @@ public:
+     }
+ 
+     [[nodiscard]] std::size_t GetSize() const { return m_queries.size(); }
++    void RequireLastAffectedRows(uint64 rows) { m_requiredAffectedRows[m_queries.size() - 1] = rows; }
+ 
+ protected:
+     void AppendPreparedStatement(PreparedStatementBase* statement);
+     void Cleanup();
+     std::vector<SQLElementData> m_queries;
++    std::map<std::size_t, uint64> m_requiredAffectedRows;
+ 
+ private:
+     bool _cleanedUp{false};
+@@ -106,6 +110,16 @@ protected:
+     TransactionPromise m_result;
+ };
+ 
++class AC_DATABASE_API CheckedTransactionTask : public TransactionTask
++{
++public:
++    explicit CheckedTransactionTask(std::shared_ptr<TransactionBase> trans) : TransactionTask(std::move(trans)) { }
++    std::future<TransactionOutcome> GetFuture() { return m_result.get_future(); }
++protected:
++    bool Execute() override;
++    std::promise<TransactionOutcome> m_result;
++};
++
+ class AC_DATABASE_API TransactionCallback
+ {
+ public:
+diff --git a/src/server/game/Entities/GameObject/GameObject.cpp b/src/server/game/Entities/GameObject/GameObject.cpp
+index 5e09ded7d..dc3a572f9 100644
+--- a/src/server/game/Entities/GameObject/GameObject.cpp
++++ b/src/server/game/Entities/GameObject/GameObject.cpp
+@@ -18,6 +18,7 @@
+ #include "AccountMgr.h"
+ #include "BattlegroundAV.h"
+ #include "CellImpl.h"
++#include "Config.h"
+ #include "CreatureAISelector.h"
+ #include "DisableMgr.h"
+ #include "GameObjectAI.h"
+@@ -27,6 +28,7 @@
+ #include "Group.h"
+ #include "GroupMgr.h"
+ #include "ObjectMgr.h"
++#include "ObjectAccessor.h"
+ #include "OutdoorPvPMgr.h"
+ #include "PoolMgr.h"
+ #include "ScriptMgr.h"
+@@ -777,7 +779,8 @@ void GameObject::Update(uint32 diff)
+                         }
+ 
+                         // Non-consumable chest was partially looted and restock time passed, restock all loot now
+-                        if (GetGOInfo()->chest.consumable == 0 && GameTime::GetGameTime() >= m_restockTime)
++                        if (GetGOInfo()->chest.consumable == 0 && GameTime::GetGameTime() >= m_restockTime &&
++                            (!loot.HasPersonalLoot() || loot.isLooted()))
+                         {
+                             m_restockTime = 0s;
+                             m_lootState = GO_READY;
+@@ -2685,6 +2688,7 @@ void GameObject::SetLootRecipient(Creature* creature)
+     m_lootRecipient = creature->GetLootRecipientGUID();
+     m_lootRecipientGroup = creature->GetLootRecipientGroupGUID();
+     SetAllowedLooters(creature->GetAllowedLooters());
++    PreparePersonalJournalLoot();
+ }
+ 
+ void GameObject::SetLootRecipient(Map* map)
+@@ -2723,10 +2727,38 @@ void GameObject::SetLootRecipient(Map* map)
+     {
+         AddAllowedLooter(m_lootRecipient);
+     }
++    PreparePersonalJournalLoot();
++}
++
++void GameObject::PreparePersonalJournalLoot()
++{
++    if (!Loot::GenerationJournalEnabled() || GetGoType() != GAMEOBJECT_TYPE_CHEST ||
++        !HasLootRecipient() || loot.HasPersonalLoot())
++        return;
++    static bool const bossChests = sConfigMgr->GetOption<bool>("PersonalLoot.BossChests", true);
++    if (!bossChests)
++        return;
++    Player* owner = GetLootRecipient();
++    if (!owner)
++        for (ObjectGuid guid : GetAllowedLooters())
++            if ((owner = ObjectAccessor::FindConnectedPlayer(guid)))
++                break;
++    if (!owner || owner->GetMap() != GetMap() || !GetGOInfo()->GetLootId())
++        return;
++    loot.FillLoot(GetGOInfo()->GetLootId(), LootTemplates_Gameobject, owner, true, false, GetLootMode(), this);
++    if (!loot.HasPersonalLoot())
++        return;
++    if (auto addon = GetTemplateAddon())
++        loot.generateMoneyLoot(addon->mingold, addon->maxgold);
++    SetLootGenerationTime();
++    loot.JournalPersonalLoot(this, GetLootMode());
+ }
+ 
+ bool GameObject::IsLootAllowedFor(Player const* player) const
+ {
++    if (loot.HasPersonalLoot())
++        return !player->HasPendingBind() && loot.GetPersonalLoot(player->GetGUID());
++
+     if (!m_lootRecipient && !m_lootRecipientGroup)
+     {
+         return true;
+diff --git a/src/server/game/Entities/GameObject/GameObject.h b/src/server/game/Entities/GameObject/GameObject.h
+index 4ae67a444..df8b7e248 100644
+--- a/src/server/game/Entities/GameObject/GameObject.h
++++ b/src/server/game/Entities/GameObject/GameObject.h
+@@ -251,6 +251,7 @@ public:
+     [[nodiscard]] Group* GetLootRecipientGroup() const;
+     void SetLootRecipient(Creature* creature);
+     void SetLootRecipient(Map* map);
++    void PreparePersonalJournalLoot();
+     bool IsLootAllowedFor(Player const* player) const;
+     [[nodiscard]] bool HasLootRecipient() const { return m_lootRecipient || m_lootRecipientGroup; }
+     uint32 m_groupLootTimer;                            // (msecs)timer used for group loot
+diff --git a/src/server/game/Entities/Item/Item.cpp b/src/server/game/Entities/Item/Item.cpp
+index b8666fa8e..15f205bce 100644
+--- a/src/server/game/Entities/Item/Item.cpp
++++ b/src/server/game/Entities/Item/Item.cpp
+@@ -335,6 +335,16 @@ void Item::UpdateDuration(Player* owner, uint32 diff)
+ }
+ 
+ void Item::SaveToDB(CharacterDatabaseTransaction trans)
++{
++    SaveToDBImpl(trans, false);
++}
++
++void Item::SaveToDBInsertOnly(CharacterDatabaseTransaction trans)
++{
++    SaveToDBImpl(trans, true);
++}
++
++void Item::SaveToDBImpl(CharacterDatabaseTransaction trans, bool insertOnly)
+ {
+     bool isInTransaction = static_cast<bool>(trans);
+     if (!isInTransaction)
+@@ -347,7 +357,8 @@ void Item::SaveToDB(CharacterDatabaseTransaction trans)
+         case ITEM_CHANGED:
+             {
+                 uint8 index = 0;
+-                CharacterDatabasePreparedStatement* stmt = CharacterDatabase.GetPreparedStatement(uState == ITEM_NEW ? CHAR_REP_ITEM_INSTANCE : CHAR_UPD_ITEM_INSTANCE);
++                CharacterDatabasePreparedStatement* stmt = CharacterDatabase.GetPreparedStatement(insertOnly ?
++                    CHAR_PL_INS_ITEM_INSTANCE : (uState == ITEM_NEW ? CHAR_REP_ITEM_INSTANCE : CHAR_UPD_ITEM_INSTANCE));
+                 stmt->SetData(  index, GetEntry());
+                 stmt->SetData(++index, GetOwnerGUID().GetRawValue());
+                 stmt->SetData(++index, GetGuidValue(ITEM_FIELD_CREATOR).GetCounter());
+diff --git a/src/server/game/Entities/Item/Item.h b/src/server/game/Entities/Item/Item.h
+index 7ee99e77b..744633aec 100644
+--- a/src/server/game/Entities/Item/Item.h
++++ b/src/server/game/Entities/Item/Item.h
+@@ -239,6 +239,8 @@ public:
+     [[nodiscard]] bool IsBoundByEnchant() const;
+     [[nodiscard]] bool IsBoundByTempEnchant() const;
+     virtual void SaveToDB(CharacterDatabaseTransaction trans);
++    void SaveToDBInsertOnly(CharacterDatabaseTransaction trans);
++    void SaveToDBImpl(CharacterDatabaseTransaction trans, bool insertOnly);
+     virtual bool LoadFromDB(ObjectGuid::LowType guid, ObjectGuid owner_guid, Field* fields, uint32 entry);
+     static void DeleteFromDB(CharacterDatabaseTransaction trans, ObjectGuid::LowType itemGuid);
+     virtual void DeleteFromDB(CharacterDatabaseTransaction trans);
+diff --git a/src/server/game/Entities/Player/Player.cpp b/src/server/game/Entities/Player/Player.cpp
+index 489450092..f5237c9bc 100644
+--- a/src/server/game/Entities/Player/Player.cpp
++++ b/src/server/game/Entities/Player/Player.cpp
+@@ -8033,9 +8033,13 @@ void Player::SendLoot(ObjectGuid guid, LootType loot_type)
+ 
+         // Xinef: loot was generated and respawntime has passed since then, allow to recreate loot
+         // Xinef: to avoid bugs, this rule covers spawned gameobjects only
+-        if (go->isSpawnedByDefault() && go->getLootState() == GO_ACTIVATED && !go->loot.isLooted() && go->GetLootGenerationTime() + go->GetRespawnDelay() < GameTime::GetGameTime().count())
++        if (!go->loot.HasPersonalLoot() && go->isSpawnedByDefault() && go->getLootState() == GO_ACTIVATED && !go->loot.isLooted() && go->GetLootGenerationTime() + go->GetRespawnDelay() < GameTime::GetGameTime().count())
+             go->SetLootState(GO_READY);
+ 
++        // Scripts may reset chest state; existing pending personal rewards remain authoritative.
++        if (go->getLootState() == GO_READY && go->loot.HasPersonalLoot() && !go->loot.isLooted())
++            go->SetLootState(GO_ACTIVATED, this);
++
+         if (go->getLootState() == GO_READY)
+         {
+             uint32 lootid = go->GetGOInfo()->GetLootId();
+@@ -8069,7 +8073,7 @@ void Player::SendLoot(ObjectGuid guid, LootType loot_type)
+                 if (groupRules && !go->loot.empty())
+                     group->UpdateLooterGuid(go);
+ 
+-                if (groupRules)
++                if (groupRules && !loot->HasPersonalLoot())
+                 {
+                     GuidUnorderedSet const& allowedLooters = go->GetAllowedLooters();
+                     if (!allowedLooters.empty())
+@@ -8081,12 +8085,18 @@ void Player::SendLoot(ObjectGuid guid, LootType loot_type)
+             if (GameObjectTemplateAddon const* addon = go->GetTemplateAddon())
+                 loot->generateMoneyLoot(addon->mingold, addon->maxgold);
+ 
++            if (!loot->JournalPersonalLoot(go, go->GetLootMode()))
++            {
++                SendLootError(guid, LOOT_ERROR_LOCKED);
++                return;
++            }
++
+             if (loot_type == LOOT_FISHING)
+                 go->GetFishLoot(loot, this);
+             else if (loot_type == LOOT_FISHING_JUNK)
+                 go->GetFishLoot(loot, this, true);
+ 
+-            if (go->GetGOInfo()->type == GAMEOBJECT_TYPE_CHEST && go->GetGOInfo()->chest.groupLootRules)
++            if (!loot->HasPersonalLoot() && go->GetGOInfo()->type == GAMEOBJECT_TYPE_CHEST && go->GetGOInfo()->chest.groupLootRules)
+             {
+                 if (Group* group = GetGroup())
+                 {
+@@ -8266,13 +8276,13 @@ void Player::SendLoot(ObjectGuid guid, LootType loot_type)
+             // the player whose group may loot the corpse
+             Player* recipient = creature->GetLootRecipient();
+             Group* recipientGroup = creature->GetLootRecipientGroup();
+-            if (!recipient && !recipientGroup)
++            if (!recipient && !recipientGroup && !loot->HasPersonalLoot())
+                 return;
+ 
+             if (loot->loot_type == LOOT_NONE)
+             {
+                 // for creature, loot is filled when creature is killed.
+-                if (recipientGroup)
++                if (recipientGroup && !loot->HasPersonalLoot())
+                 {
+                     switch (recipientGroup->GetLootMethod())
+                     {
+@@ -8347,6 +8357,29 @@ void Player::SendLoot(ObjectGuid guid, LootType loot_type)
+         }
+     }
+ 
++    if (loot->HasPersonalLoot())
++    {
++        WorldObject* journalSource = guid.IsGameObject() ?
++            static_cast<WorldObject*>(GetMap()->GetGameObject(guid)) : GetMap()->GetCreature(guid);
++        if (!loot->JournalPersonalLoot(journalSource, LOOT_MODE_DEFAULT))
++        {
++            SendLootError(guid, LOOT_ERROR_LOCKED);
++            return;
++        }
++
++        Loot* result = loot->GetPersonalLoot(GetGUID());
++        if (!result)
++        {
++            SendLootError(guid, LOOT_ERROR_DIDNT_KILL);
++            return;
++        }
++
++        // Frozen recipients retain access even if group membership changes after the kill.
++        permission = OWNER_PERMISSION;
++        loot->AddLooter(GetGUID());
++        loot = result;
++    }
++
+     // LOOT_INSIGNIA and LOOT_FISHINGHOLE unsupported by client
+     switch (loot_type)
+     {
+@@ -13884,7 +13917,14 @@ LootItem* Player::StoreLootItem(uint8 lootSlot, Loot* loot, InventoryResult& msg
+     if (msg == EQUIP_ERR_OK)
+     {
+         AllowedLooterSet looters = item->GetAllowedLooters();
+-        Item* newitem = StoreNewItem(dest, item->itemid, true, item->randomPropertyId, looters);
++        Item* newitem = loot->IsJournalManaged() ? StoreJournalLootItem(loot, item, dest) :
++            StoreNewItem(dest, item->itemid, true, item->randomPropertyId, looters);
++        if (!newitem)
++        {
++            msg = EQUIP_ERR_CANT_DO_RIGHT_NOW;
++            SendEquipError(msg, nullptr, nullptr);
++            return nullptr;
++        }
+ 
+         if (qitem)
+         {
+diff --git a/src/server/game/Entities/Player/Player.h b/src/server/game/Entities/Player/Player.h
+index 46160a181..97e557224 100644
+--- a/src/server/game/Entities/Player/Player.h
++++ b/src/server/game/Entities/Player/Player.h
+@@ -1339,6 +1339,14 @@ public:
+     void AutoStoreLoot(uint8 bag, uint8 slot, uint32 loot_id, LootStore const& store, bool broadcast = false);
+     void AutoStoreLoot(uint32 loot_id, LootStore const& store, bool broadcast = false) { AutoStoreLoot(NULL_BAG, NULL_SLOT, loot_id, store, broadcast); }
+     LootItem* StoreLootItem(uint8 lootSlot, Loot* loot, InventoryResult& msg);
++    Item* StoreJournalLootItem(Loot* loot, LootItem* item, ItemPosCountVec const& dest,
++        uint32 recoveryMail = 0, Item* original = nullptr);
++    bool ClaimJournalGold(Loot* loot, uint32 amount);
++    bool ClaimRecoveryMailGold(uint32 mail, uint32 amount);
++    bool FlushJournalInventory();
++    void UpdateJournalRecovery(uint32 diff);
++    void QuarantineJournalFailure();
++    [[nodiscard]] bool HasJournalPersistenceFault() const { return m_journalPersistenceFault; }
+     void UpdateLootAchievements(LootItem* item, Loot* loot);
+     void UpdateTitansGrip();
+ 
+@@ -3085,6 +3093,8 @@ private:
+     bool _expectingChangeTransport;
+     uint32 _pendingFlightChangeCounter;
+     uint32 _mapChangeOrderCounter;
++    bool m_journalPersistenceFault{false};
++    uint32 m_journalRecoveryTimer{15000};
+ };
+ 
+ void AddItemsSetItem(Player* player, Item* item);
+diff --git a/src/server/game/Entities/Player/PlayerStorage.cpp b/src/server/game/Entities/Player/PlayerStorage.cpp
+index e9b70149a..83acbeeaa 100644
+--- a/src/server/game/Entities/Player/PlayerStorage.cpp
++++ b/src/server/game/Entities/Player/PlayerStorage.cpp
+@@ -5777,6 +5777,11 @@ bool Player::isAllowedToLoot(Creature const* creature)
+         return false;
+ 
+     Loot const* loot = &creature->loot;
++    if (loot->HasPersonalLoot())
++    {
++        Loot const* result = loot->GetPersonalLoot(GetGUID());
++        return result && (loot->gold != 0 || !result->isLooted());
++    }
+     if (loot->isLooted()) // nothing to loot or everything looted.
+         return false;
+ 
+@@ -7264,6 +7269,8 @@ void Player::SaveToDB(bool create, bool logout)
+ 
+ void Player::SaveToDB(CharacterDatabaseTransaction trans, bool create, bool logout)
+ {
++    if (m_journalPersistenceFault)
++        return;
+     // delay auto save at any saves (manual, in code, or autosave)
+     m_nextSave = sWorld->getIntConfig(CONFIG_INTERVAL_SAVE);
+ 
+@@ -7338,6 +7345,8 @@ void Player::AdditionalSavingAddMask(uint8 mask)
+ // fast save function for item/money cheating preventing - save only inventory and money state
+ void Player::SaveInventoryAndGoldToDB(CharacterDatabaseTransaction trans)
+ {
++    if (m_journalPersistenceFault)
++        return;
+     _SaveInventory(trans);
+     SaveGoldToDB(trans);
+ }
+diff --git a/src/server/game/Entities/Unit/Unit.cpp b/src/server/game/Entities/Unit/Unit.cpp
+index 5a38de66e..5499c7234 100644
+--- a/src/server/game/Entities/Unit/Unit.cpp
++++ b/src/server/game/Entities/Unit/Unit.cpp
+@@ -13628,10 +13628,14 @@ void Unit::Kill(Unit* killer, Unit* victim, bool durabilityLoss, WeaponAttackTyp
+ 
+             if (uint32 lootid = creature->GetCreatureTemplate()->lootid)
+                 loot->FillLoot(lootid, LootTemplates_Creature, looter, false, false, creature->GetLootMode(), creature);
++            else
++                loot->FillLoot(0, LootTemplates_Creature, looter, false, true, creature->GetLootMode(), creature);
+ 
+             if (creature->GetLootMode())
+                 loot->generateMoneyLoot(creature->GetCreatureTemplate()->mingold, creature->GetCreatureTemplate()->maxgold);
+ 
++            loot->JournalPersonalLoot(creature, creature->GetLootMode());
++
+             if (group)
+             {
+                 if (hasLooterGuid)
+diff --git a/src/server/game/Handlers/LootHandler.cpp b/src/server/game/Handlers/LootHandler.cpp
+index a18781f0e..4a6205a60 100644
+--- a/src/server/game/Handlers/LootHandler.cpp
++++ b/src/server/game/Handlers/LootHandler.cpp
+@@ -101,6 +101,13 @@ void WorldSession::HandleAutostoreLootItemOpcode(WorldPacket& recvData)
+         loot = &creature->loot;
+     }
+ 
++    loot = loot->GetPersonalLoot(player->GetGUID());
++    if (!loot)
++    {
++        player->SendLootError(lguid, LOOT_ERROR_DIDNT_KILL);
++        return;
++    }
++
+     sScriptMgr->OnPlayerAfterCreatureLoot(player);
+ 
+     InventoryResult msg;
+@@ -187,6 +194,13 @@ void WorldSession::HandleLootMoneyOpcode(WorldPacket& /*recvData*/)
+ 
+     if (loot)
+     {
++        if (loot->HasPersonalMoney() && loot->HasPersonalLoot())
++        {
++            loot = loot->GetPersonalLoot(player->GetGUID());
++            if (!loot)
++                return;
++            shareMoney = false;
++        }
+         // the money is zeroed and dropped from storage below no matter who is paid, so a fully
+         // restricted looter would destroy it rather than receive it. Bail before that teardown;
+         // reachable for windows not opened through HandleLootOpcode, e.g. chests and lockboxes.
+@@ -197,6 +211,17 @@ void WorldSession::HandleLootMoneyOpcode(WorldPacket& /*recvData*/)
+         }
+ 
+         sScriptMgr->OnPlayerBeforeLootMoney(player, loot);
++        if (loot->IsJournalManaged())
++        {
++            uint32 amount = loot->gold;
++            if (player->HasPlayerFlag(PLAYER_FLAGS_PARTIAL_PLAY_TIME))
++                amount /= 2;
++            if (!player->ClaimJournalGold(loot, amount))
++            {
++                player->SendLootError(guid, LOOT_ERROR_LOCKED);
++                return;
++            }
++        }
+         loot->NotifyMoneyRemoved();
+         if (shareMoney && player->GetGroup())      //item, pickpocket and players can be looted only single player
+         {
+@@ -258,7 +283,8 @@ void WorldSession::HandleLootMoneyOpcode(WorldPacket& /*recvData*/)
+ 
+             if (award)
+             {
+-                player->ModifyMoney(finalGold);
++                if (!loot->IsJournalManaged())
++                    player->ModifyMoney(finalGold);
+                 player->UpdateAchievementCriteria(ACHIEVEMENT_CRITERIA_TYPE_LOOT_MONEY, finalGold);
+ 
+                 WorldPacket data(SMSG_LOOT_MONEY_NOTIFY, 4 + 1);
+@@ -471,6 +497,8 @@ void WorldSession::DoLootRelease(ObjectGuid lguid)
+     //Player is not looking at loot list, he doesn't need to see updates on the loot list
+     if (!lguid.IsItem())
+     {
++        if (Loot* result = loot->GetPersonalLoot(player->GetGUID()))
++            result->RemoveLooter(player->GetGUID());
+         loot->RemoveLooter(player->GetGUID());
+     }
+ }
+@@ -529,7 +557,7 @@ void WorldSession::HandleLootMasterGiveOpcode(WorldPacket& recvData)
+         loot = &pGO->loot;
+     }
+ 
+-    if (!loot)
++    if (!loot || loot->HasPersonalLoot())
+         return;
+ 
+     if (slotid >= loot->items.size() + loot->quest_items.size())
+diff --git a/src/server/game/Handlers/MailHandler.cpp b/src/server/game/Handlers/MailHandler.cpp
+index 09f159bd2..cd6bcd829 100644
+--- a/src/server/game/Handlers/MailHandler.cpp
++++ b/src/server/game/Handlers/MailHandler.cpp
+@@ -30,6 +30,8 @@
+ #include "ObjectMgr.h"
+ #include "Opcodes.h"
+ #include "Player.h"
++#include "PersonalLootPersistence.h"
++#include "LootMgr.h"
+ #include "ScriptMgr.h"
+ #include "WorldPacket.h"
+ #include "WorldSession.h"
+@@ -560,6 +562,32 @@ void WorldSession::HandleMailTakeItem(WorldPacket& recvData)
+ 
+     ItemPosCountVec dest;
+     uint8 msg = _player->CanStoreItem(NULL_BAG, NULL_SLOT, dest, it, false);
++    int recovery = PersonalLootPersistence::RecoveryMailStatus(player, mailId);
++    if (recovery < 0)
++    {
++        player->SendMailResult(mailId, MAIL_ITEM_TAKEN, MAIL_ERR_INTERNAL_ERROR);
++        return;
++    }
++    if (recovery == 1 && msg == EQUIP_ERR_OK)
++    {
++        if (player->HasPlayerFlag(PLAYER_FLAGS_NO_PLAY_TIME))
++            return;
++        LootItem reward{};
++        reward.itemid = it->GetEntry();
++        reward.count = uint8(it->GetCount());
++        reward.randomPropertyId = it->GetItemRandomPropertyId();
++        reward.randomSuffix = it->GetItemSuffixFactor();
++        uint32 count = it->GetCount();
++        Item* stored = player->StoreJournalLootItem(nullptr, &reward, dest, mailId, it);
++        if (!stored)
++        {
++            player->SendMailResult(mailId, MAIL_ITEM_TAKEN, MAIL_ERR_INTERNAL_ERROR);
++            return;
++        }
++        player->SendMailResult(mailId, MAIL_ITEM_TAKEN, MAIL_OK, 0, itemLowGuid, count);
++        sScriptMgr->OnPlayerAfterTakeItemFromMail(player, stored, count);
++        return;
++    }
+     if (msg == EQUIP_ERR_OK)
+     {
+         CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
+@@ -652,6 +680,20 @@ void WorldSession::HandleMailTakeMoney(WorldPacket& recvData)
+         return;
+     }
+ 
++    int recovery = PersonalLootPersistence::RecoveryMailStatus(player, mailId);
++    if (recovery < 0)
++    {
++        player->SendMailResult(mailId, MAIL_MONEY_TAKEN, MAIL_ERR_INTERNAL_ERROR);
++        return;
++    }
++    if (recovery == 1)
++    {
++        if (player->HasPlayerFlag(PLAYER_FLAGS_NO_PLAY_TIME) || !player->ClaimRecoveryMailGold(mailId, m->money))
++            player->SendMailResult(mailId, MAIL_MONEY_TAKEN, MAIL_ERR_INTERNAL_ERROR);
++        else
++            player->SendMailResult(mailId, MAIL_MONEY_TAKEN, MAIL_OK);
++        return;
++    }
+     if (!player->ModifyMoney(m->money, false))
+     {
+         player->SendMailResult(mailId, MAIL_MONEY_TAKEN, MAIL_ERR_EQUIP_ERROR, EQUIP_ERR_TOO_MUCH_GOLD);
+diff --git a/src/server/game/Instances/InstanceSaveMgr.cpp b/src/server/game/Instances/InstanceSaveMgr.cpp
+index 14ce15f25..de78a26fc 100644
+--- a/src/server/game/Instances/InstanceSaveMgr.cpp
++++ b/src/server/game/Instances/InstanceSaveMgr.cpp
+@@ -23,6 +23,7 @@
+ #include "Group.h"
+ #include "InstanceScript.h"
+ #include "Log.h"
++#include "LootMgr.h"
+ #include "Map.h"
+ #include "MapInstanced.h"
+ #include "MapMgr.h"
+@@ -99,6 +100,9 @@ InstanceSave* InstanceSaveMgr::AddInstanceSave(uint32 mapId, uint32 instanceId,
+         extendedResetTime = 0;
+     }
+     InstanceSave* save = new InstanceSave(mapId, instanceId, difficulty, resetTime, extendedResetTime);
++    static bool const generationJournal = sConfigMgr->GetOption<bool>("PersonalLoot.GenerationJournal", false);
++    if (generationJournal)
++        Loot::InitializeJournalInstanceCycle(instanceId, mapId, uint8(difficulty), startup);
+     if (!startup)
+         save->InsertToDB();
+ 
+diff --git a/src/server/game/Loot/LootMgr.cpp b/src/server/game/Loot/LootMgr.cpp
+index a103aab09..41e590b72 100644
+--- a/src/server/game/Loot/LootMgr.cpp
++++ b/src/server/game/Loot/LootMgr.cpp
+@@ -16,6 +16,22 @@
+  */
+ 
+ #include "LootMgr.h"
++#include "Creature.h"
++#include "CryptoRandom.h"
++#include "DatabaseEnv.h"
++#include "GameObject.h"
++#include "GameTime.h"
++#include "Map.h"
++#include "PreparedStatement.h"
++#include "QueryResult.h"
++#include "Transaction.h"
++#include "WorldSession.h"
++#include <atomic>
++#include <algorithm>
++#include <cctype>
++#include <iomanip>
++#include <sstream>
++#include <mutex>
+ #include "Containers.h"
+ #include "DisableMgr.h"
+ #include "Group.h"
+@@ -502,7 +518,7 @@ void Loot::AddItem(LootStoreItem const& item)
+         bool canSeeItemInLootWindow = false;
+         if (auto player = ObjectAccessor::FindPlayer(lootOwnerGUID))
+         {
+-            if (auto group = player->GetGroup())
++            if (auto group = !isPersonalLeaf ? player->GetGroup() : nullptr)
+             {
+                 for (auto itr = group->GetFirstMember(); itr != nullptr; itr = itr->next())
+                 {
+@@ -547,6 +563,40 @@ bool Loot::FillLoot(uint32 lootId, LootStore const& store, Player* lootOwner, bo
+ 
+     LootTemplate const* tab = store.GetLootFor(lootId);
+ 
++    items.reserve(MAX_NR_LOOT_ITEMS);
++    quest_items.reserve(MAX_NR_QUEST_ITEMS);
++
++    std::vector<Player*> recipients;
++    if (!isPersonalLeaf)
++        sScriptMgr->OnSelectPersonalLootRecipients(lootSource, lootOwner, store, recipients);
++    if (!isPersonalLeaf && personalMoney && GenerationJournalEnabled())
++        journalManaged = true;
++
++    if (!recipients.empty())
++    {
++        for (Player* recipient : recipients)
++        {
++            if (!recipient || personalLoot.contains(recipient->GetGUID()))
++                continue;
++
++            auto result = std::make_unique<Loot>();
++            result->isPersonalLeaf = true;
++            result->journalManaged = GenerationJournalEnabled();
++            result->journalAccountId = recipient->GetSession()->GetAccountId();
++            result->journalCharacterCreatedAt = uint64(recipient->GetCreationTime().count());
++            journalManaged = result->journalManaged;
++            result->sharedMoneySource = personalMoney ? nullptr : this;
++            result->sourceWorldObjectGUID = sourceWorldObjectGUID;
++            result->sourceGameObject = sourceGameObject;
++            result->FillLoot(lootId, store, recipient, true, noEmptyError, lootMode, lootSource);
++            personalLoot.emplace(recipient->GetGUID(), std::move(result));
++        }
++
++        if (!personalLoot.empty())
++            return true;
++    }
++
++    // Initial group is 0, top level set to True
+     if (!tab)
+     {
+         if (!noEmptyError)
+@@ -554,10 +604,6 @@ bool Loot::FillLoot(uint32 lootId, LootStore const& store, Player* lootOwner, bo
+         return false;
+     }
+ 
+-    items.reserve(MAX_NR_LOOT_ITEMS);
+-    quest_items.reserve(MAX_NR_QUEST_ITEMS);
+-
+-    // Initial group is 0, top level set to True
+     tab->Process(*this, store, lootMode, lootOwner, 0, true);          // Processing is done there, callback via Loot::AddItem()
+ 
+     sScriptMgr->OnAfterLootTemplateProcess(this, tab, store, lootOwner, personal, noEmptyError, lootMode);
+@@ -593,6 +639,341 @@ bool Loot::FillLoot(uint32 lootId, LootStore const& store, Player* lootOwner, bo
+     return true;
+ }
+ 
++namespace
++{
++    std::atomic<bool> generationJournalEnabled{false};
++    std::mutex journalCycleMutex;
++    std::map<uint32, std::string> journalInstanceCycles;
++
++    std::string JournalItemMetadata(LootItem const& item, bool eligible)
++    {
++        std::ostringstream json;
++        json << "{\"version\":1,\"itemIndex\":" << item.itemIndex << ",\"group\":" << uint32(item.groupid)
++             << ",\"eligibleAtGeneration\":" << (eligible ? "true" : "false") << ",\"allowed\":[";
++        bool first = true;
++        for (ObjectGuid guid : item.allowedGUIDs)
++        {
++            if (!first)
++                json << ',';
++            first = false;
++            json << guid.GetRawValue();
++        }
++        json << "],\"conditions\":[";
++        first = true;
++        for (Condition const* condition : item.conditions)
++        {
++            if (!first)
++                json << ',';
++            first = false;
++            json << '[' << uint32(condition->SourceType) << ',' << condition->SourceGroup << ','
++                 << condition->SourceEntry << ',' << condition->SourceId << ',' << condition->ElseGroup << ','
++                 << uint32(condition->ConditionType) << ',' << condition->ConditionValue1 << ','
++                 << condition->ConditionValue2 << ',' << condition->ConditionValue3 << ','
++                 << condition->ErrorType << ',' << condition->ErrorTextId << ',' << condition->ReferenceId << ','
++                 << condition->ScriptId << ',' << uint32(condition->ConditionTarget) << ','
++                 << condition->NegativeCondition << ']';
++        }
++        json << "]}";
++        return json.str();
++    }
++
++    uint32 JournalItemFlags(LootItem const& item)
++    {
++        return uint32(item.is_looted) | (uint32(item.is_blocked) << 1) | (uint32(item.freeforall) << 2) |
++            (uint32(item.is_underthreshold) << 3) | (uint32(item.is_counted) << 4) |
++            (uint32(item.needs_quest) << 5) | (uint32(item.follow_loot_rules) << 6);
++    }
++}
++
++void Loot::SetGenerationJournalEnabled(bool enabled)
++{
++    generationJournalEnabled.store(enabled);
++}
++
++bool Loot::GenerationJournalEnabled()
++{
++    return generationJournalEnabled.load();
++}
++
++void Loot::InitializeJournalInstanceCycle(uint32 instanceId, uint32 mapId, uint8 difficulty, bool loaded)
++{
++    std::lock_guard<std::mutex> guard(journalCycleMutex);
++    journalInstanceCycles[instanceId].clear(); // Any unconfirmed replacement fails closed for this lifetime.
++    auto read = [&]()
++    {
++        auto statement = CharacterDatabase.GetPreparedStatement(CHAR_PL_SEL_INSTANCE_CYCLE);
++        statement->SetData(0, instanceId);
++        return CharacterDatabase.Query(statement);
++    };
++    auto accept = [&](PreparedQueryResult const& row)
++    {
++        if (!row || row->Fetch()[1].Get<uint32>() != mapId || row->Fetch()[2].Get<uint8>() != difficulty)
++            return false;
++        journalInstanceCycles[instanceId] = row->Fetch()[0].Get<std::string>();
++        return true;
++    };
++    if (loaded && accept(read()))
++        return;
++    std::string cycle = ByteArrayToHexStr(Acore::Crypto::GetRandomBytes<16>());
++    auto transaction = CharacterDatabase.BeginTransaction();
++    auto statement = CharacterDatabase.GetPreparedStatement(
++        loaded ? CHAR_PL_INS_INSTANCE_CYCLE : CHAR_PL_REP_INSTANCE_CYCLE);
++    statement->SetData(0, instanceId);
++    statement->SetData(1, cycle);
++    statement->SetData(2, mapId);
++    statement->SetData(3, difficulty);
++    transaction->Append(statement);
++    CharacterDatabase.DirectCommitCheckedTransaction(transaction);
++    auto confirmed = read();
++    if (confirmed && confirmed->Fetch()[0].Get<std::string>() == cycle)
++        accept(confirmed);
++    else
++        LOG_ERROR("module.personal_loot", "Instance {} journal cycle could not be confirmed; rewards blocked.",
++            instanceId);
++}
++
++bool Loot::JournalPersonalLoot(WorldObject* source, uint16 lootMode)
++{
++    if (!journalManaged)
++        return true;
++    if (journalCommitted)
++        return ReconcileJournalClaims();
++    if (!source || !personalMoney)
++        return false; // Shared gold requires a separate ownership policy, never duplicate it into leaves.
++
++    Creature* creature = source->ToCreature();
++    GameObject* chest = source->ToGameObject();
++    if (!creature && !chest)
++        return false;
++    if (journalEventId.empty())
++    {
++        journalLootMode = lootMode;
++        auto random = Acore::Crypto::GetRandomBytes<16>();
++        std::ostringstream id;
++        id << std::hex << std::setfill('0');
++        for (uint8 byte : random)
++            id << std::setw(2) << uint32(byte);
++        journalEventId = id.str();
++        std::ostringstream key;
++        if (source->GetInstanceId() && (chest || creature->IsDungeonBoss()))
++        {
++            std::lock_guard<std::mutex> guard(journalCycleMutex);
++            std::string const& cycle = journalInstanceCycles[source->GetInstanceId()];
++            if (cycle.empty())
++            {
++                journalEventId.clear();
++                return false;
++            }
++            key << "instance:" << source->GetMapId() << ':' << cycle << ':'
++                << uint32(source->GetMap()->GetSpawnMode()) << ':' << (chest ? 'g' : 'c') << ':'
++                << source->GetEntry() << ':' << (chest ? chest->GetSpawnId() : creature->GetSpawnId());
++        }
++        else
++            key << "occurrence:" << journalEventId;
++        journalSourceKey = key.str();
++    }
++
++    auto readExisting = [&]()
++    {
++        auto statement = CharacterDatabase.GetPreparedStatement(CHAR_PL_SEL_SNAPSHOT);
++        statement->SetData(0, journalSourceKey);
++        return CharacterDatabase.Query(statement);
++    };
++    if (auto existing = readExisting())
++    {
++        std::string expected = journalEventId;
++        std::transform(expected.begin(), expected.end(), expected.begin(), [](unsigned char value)
++        {
++            return static_cast<char>(std::toupper(value));
++        });
++        // The same operation may have committed without an acknowledgement.
++        journalCommitted = existing->Fetch()[0].Get<std::string>() == expected &&
++            existing->Fetch()[1].Get<uint32>() == 1;
++        if (!journalCommitted)
++            return RestoreJournal(existing->Fetch()[0].Get<std::string>(), existing->Fetch()[2].Get<std::string>());
++        for (auto const& [guid, result] : personalLoot)
++        {
++            result->journalEventId = journalEventId;
++            result->journalCommitted = true;
++        }
++        return ReconcileJournalClaims();
++    }
++    if (!HasPersonalLoot())
++        return false;
++
++    auto transaction = CharacterDatabase.BeginTransaction();
++    uint64 now = static_cast<uint64>(GameTime::GetGameTime().count());
++    auto event = CharacterDatabase.GetPreparedStatement(CHAR_PL_INS_EVENT);
++    event->SetData(0, journalEventId);
++    event->SetData(1, journalSourceKey);
++    event->SetData(2, uint8(chest ? 1 : 0));
++    event->SetData(3, source->GetEntry());
++    event->SetData(4, chest ? chest->GetSpawnId() : creature->GetSpawnId());
++    event->SetData(5, source->GetMapId());
++    event->SetData(6, source->GetInstanceId());
++    event->SetData(7, source->GetMap()->GetSpawnMode());
++    event->SetData(8, journalLootMode);
++    event->SetData(9, now);
++    transaction->Append(event);
++
++    std::ostringstream snapshot;
++    snapshot << "{\"version\":1,\"sourceGuid\":" << source->GetGUID().GetRawValue()
++             << ",\"rootOwner\":" << lootOwnerGUID.GetRawValue() << ",\"rootGold\":" << gold
++             << ",\"personalGold\":true,\"recipients\":[";
++    bool firstRecipient = true;
++    for (auto const& [guid, result] : personalLoot)
++    {
++        auto recipient = CharacterDatabase.GetPreparedStatement(CHAR_PL_INS_RECIPIENT);
++        recipient->SetData(0, journalEventId);
++        recipient->SetData(1, guid.GetRawValue());
++        recipient->SetData(2, result->journalAccountId);
++        recipient->SetData(3, std::string("{\"version\":1,\"frozenAtGeneration\":true,\"characterCreatedAt\":") +
++            std::to_string(result->journalCharacterCreatedAt) + '}');
++        recipient->SetData(4, uint8(1));
++        transaction->Append(recipient);
++
++        if (!firstRecipient)
++            snapshot << ',';
++        firstRecipient = false;
++        snapshot << "{\"guid\":" << guid.GetRawValue() << ",\"gold\":" << result->gold
++                 << ",\"unlooted\":" << uint32(result->unlootedCount) << ",\"items\":[";
++        uint32 index = 0;
++        bool firstItem = true;
++        auto appendItem = [&](LootItem& item, bool quest)
++        {
++            bool eligible = item.allowedGUIDs.contains(guid);
++            if (!quest && item.freeforall)
++                if (auto tracked = result->PlayerFFAItems.find(guid); tracked != result->PlayerFFAItems.end())
++                    eligible = std::any_of(tracked->second->begin(), tracked->second->end(),
++                        [&](QuestItem const& row) { return row.index == item.itemIndex; });
++            if (!eligible)
++                item.is_looted = true; // Hidden rolls never become later entitlements through a quest/faction change.
++            std::string metadata = JournalItemMetadata(item, eligible);
++            auto reward = CharacterDatabase.GetPreparedStatement(CHAR_PL_INS_REWARD);
++            reward->SetData(0, journalEventId);
++            reward->SetData(1, guid.GetRawValue());
++            reward->SetData(2, index++);
++            reward->SetData(3, uint8(0));
++            reward->SetData(4, item.itemid);
++            reward->SetData(5, eligible ? uint64(item.count) : uint64(0));
++            reward->SetData(6, item.randomPropertyId);
++            reward->SetData(7, item.randomSuffix);
++            reward->SetData(8, JournalItemFlags(item));
++            reward->SetData(9, metadata);
++            transaction->Append(reward);
++            if (!firstItem)
++                snapshot << ',';
++            firstItem = false;
++            snapshot << "{\"questRow\":" << quest << ",\"id\":" << item.itemid << ",\"count\":"
++                     << uint32(item.count) << ",\"property\":" << item.randomPropertyId << ",\"suffix\":"
++                     << item.randomSuffix << ",\"flags\":" << JournalItemFlags(item)
++                     << ",\"rollWinner\":" << item.rollWinnerGUID.GetRawValue()
++                     << ",\"metadata\":" << metadata << '}';
++        };
++        for (LootItem& item : result->items)
++            appendItem(item, false);
++        for (LootItem& item : result->quest_items)
++            appendItem(item, true);
++        auto money = CharacterDatabase.GetPreparedStatement(CHAR_PL_INS_REWARD);
++        money->SetData(0, journalEventId);
++        money->SetData(1, guid.GetRawValue());
++        money->SetData(2, index);
++        money->SetData(3, uint8(1));
++        money->SetData(4, nullptr);
++        money->SetData(5, uint64(result->gold));
++        money->SetData(6, int32(0));
++        money->SetData(7, uint32(0));
++        money->SetData(8, uint32(0));
++        money->SetData(9, std::string("{}"));
++        transaction->Append(money);
++        snapshot << ']';
++        auto appendTracking = [&](char const* name, QuestItemMap const& tracking)
++        {
++            snapshot << ",\"" << name << "\":[";
++            bool first = true;
++            for (auto const& [playerGuid, list] : tracking)
++                if (list)
++                    for (QuestItem const& entry : *list)
++                    {
++                        if (!first)
++                            snapshot << ',';
++                        first = false;
++                        snapshot << "{\"guid\":" << playerGuid.GetRawValue() << ",\"index\":"
++                                 << uint32(entry.index) << ",\"looted\":" << entry.is_looted << '}';
++                    }
++            snapshot << ']';
++        };
++        appendTracking("questTracking", result->PlayerQuestItems);
++        appendTracking("ffaTracking", result->PlayerFFAItems);
++        appendTracking("conditionalTracking", result->PlayerNonQuestNonFFAConditionalItems);
++        snapshot << '}';
++    }
++    snapshot << "]}";
++    auto saved = CharacterDatabase.GetPreparedStatement(CHAR_PL_INS_SNAPSHOT);
++    saved->SetData(0, journalEventId);
++    saved->SetData(1, snapshot.str());
++    transaction->Append(saved);
++    auto ready = CharacterDatabase.GetPreparedStatement(CHAR_PL_MARK_READY);
++    ready->SetData(0, now);
++    ready->SetData(1, journalEventId);
++    transaction->Append(ready);
++
++    TransactionOutcome outcome = CharacterDatabase.DirectCommitCheckedTransaction(transaction);
++    journalCommitted = outcome == TransactionOutcome::Committed;
++    if (journalCommitted)
++        for (auto const& [guid, result] : personalLoot)
++        {
++            result->journalEventId = journalEventId;
++            result->journalCommitted = true;
++        }
++    if (!journalCommitted)
++        LOG_ERROR("module.personal_loot", "Loot journal commit not confirmed for event {}; outcome={}",
++            journalEventId, uint32(outcome));
++    return journalCommitted;
++}
++
++bool Loot::empty() const
++{
++    if (!items.empty() || gold != 0)
++        return false;
++
++    for (auto const& [guid, result] : personalLoot)
++        if (!result->isLooted())
++            return false;
++
++    return true;
++}
++
++bool Loot::isLooted() const
++{
++    if (gold != 0 || unlootedCount != 0)
++        return false;
++
++    for (auto const& [guid, result] : personalLoot)
++        if (!result->isLooted())
++            return false;
++
++    return true;
++}
++
++Loot* Loot::GetPersonalLoot(ObjectGuid playerGuid)
++{
++    if (personalLoot.empty())
++        return this;
++
++    auto itr = personalLoot.find(playerGuid);
++    return itr != personalLoot.end() ? itr->second.get() : nullptr;
++}
++
++Loot const* Loot::GetPersonalLoot(ObjectGuid playerGuid) const
++{
++    if (personalLoot.empty())
++        return this;
++
++    auto itr = personalLoot.find(playerGuid);
++    return itr != personalLoot.end() ? itr->second.get() : nullptr;
++}
++
+ void Loot::FillNotNormalLootFor(Player* player)
+ {
+     ObjectGuid playerGuid = player->GetGUID();
+@@ -609,6 +990,10 @@ void Loot::FillNotNormalLootFor(Player* player)
+     if (qmapitr == PlayerNonQuestNonFFAConditionalItems.end())
+         FillNonQuestNonFFAConditionalLoot(player);
+ 
++    // Currency auto-loot follows the same durable claim path, after generation is committed.
++    if (journalManaged && !journalCommitted)
++        return;
++
+     // Process currency items
+     uint32 max_slot = GetMaxSlotInLootFor(player);
+     LootItem const* item = nullptr;
+@@ -660,7 +1045,8 @@ QuestItemList* Loot::FillQuestLoot(Player* player)
+ 
+     QuestItemList* ql = new QuestItemList();
+ 
+-    bool isMasterLooter = player->GetGroup() && player->GetGroup()->GetLootMethod() == MASTER_LOOT && player->GetGroup()->GetMasterLooterGuid() == player->GetGUID();
++    bool isMasterLooter = !isPersonalLeaf && player->GetGroup() &&
++        player->GetGroup()->GetLootMethod() == MASTER_LOOT && player->GetGroup()->GetMasterLooterGuid() == player->GetGUID();
+ 
+     for (uint8 i = 0; i < quest_items.size(); ++i)
+     {
+@@ -807,6 +1193,13 @@ void Loot::NotifyQuestItemRemoved(uint8 questIndex)
+ 
+ void Loot::generateMoneyLoot(uint32 minAmount, uint32 maxAmount)
+ {
++    if (personalMoney && HasPersonalLoot())
++    {
++        gold = 0;
++        for (auto& [guid, result] : personalLoot)
++            result->generateMoneyLoot(minAmount, maxAmount);
++        return;
++    }
+     if (maxAmount > 0)
+     {
+         if (maxAmount <= minAmount)
+@@ -906,6 +1299,12 @@ bool Loot::hasItemForAll() const
+ // return true if there is any FFA, quest or conditional item for the player.
+ bool Loot::hasItemFor(Player* player) const
+ {
++    if (!personalLoot.empty())
++    {
++        auto itr = personalLoot.find(player->GetGUID());
++        return itr != personalLoot.end() && !itr->second->isLooted();
++    }
++
+     QuestItemMap const& lootPlayerQuestItems = GetPlayerQuestItems();
+     QuestItemMap::const_iterator q_itr = lootPlayerQuestItems.find(player->GetGUID());
+     if (q_itr != lootPlayerQuestItems.end())
+@@ -984,7 +1383,7 @@ ByteBuffer& operator<<(ByteBuffer& b, LootView const& lv)
+ 
+     uint8 itemsShown = 0;
+ 
+-    b << uint32(l.gold);                                    //gold
++    b << uint32(l.sharedMoneySource ? l.sharedMoneySource->gold : l.gold);
+ 
+     std::size_t count_pos = b.wpos();                            // pos of item count byte
+     b << uint8(0);                                          // item count placeholder
+diff --git a/src/server/game/Loot/LootMgr.h b/src/server/game/Loot/LootMgr.h
+index 9f92a1f75..a86add062 100644
+--- a/src/server/game/Loot/LootMgr.h
++++ b/src/server/game/Loot/LootMgr.h
+@@ -25,6 +25,7 @@
+ #include "SharedDefines.h"
+ #include <list>
+ #include <map>
++#include <memory>
+ #include <unordered_map>
+ #include <vector>
+ 
+@@ -342,6 +343,13 @@ struct Loot
+     // void clear();
+     void clear()
+     {
++        AbandonJournal();
++        personalLoot.clear();
++        personalMoney = false;
++        journalManaged = false;
++        journalCommitted = false;
++        journalEventId.clear();
++        journalSourceKey.clear();
+         for (QuestItemMap::const_iterator itr = PlayerQuestItems.begin(); itr != PlayerQuestItems.end(); ++itr)
+             delete itr->second;
+         PlayerQuestItems.clear();
+@@ -357,6 +365,7 @@ struct Loot
+         PlayersLooting.clear();
+         items.clear();
+         quest_items.clear();
++        journalConditions.clear();
+         gold = 0;
+         unlootedCount = 0;
+         roundRobinPlayer.Clear();
+@@ -364,8 +373,23 @@ struct Loot
+         loot_type = LOOT_NONE;
+     }
+ 
+-    [[nodiscard]] bool empty() const { return items.empty() && gold == 0; }
+-    [[nodiscard]] bool isLooted() const { return gold == 0 && unlootedCount == 0; }
++    [[nodiscard]] bool empty() const;
++    [[nodiscard]] bool isLooted() const;
++    [[nodiscard]] bool HasPersonalLoot() const { return !personalLoot.empty(); }
++    void SetPersonalMoney(bool enabled) { personalMoney = enabled; }
++    [[nodiscard]] bool HasPersonalMoney() const { return personalMoney; }
++    static void SetGenerationJournalEnabled(bool enabled);
++    static bool GenerationJournalEnabled();
++    static void InitializeJournalInstanceCycle(uint32 instanceId, uint32 mapId, uint8 difficulty, bool loaded);
++    [[nodiscard]] bool IsJournalManaged() const { return journalManaged; }
++    bool JournalPersonalLoot(WorldObject* source, uint16 lootMode);
++    void AbandonJournal();
++    bool RestoreJournal(std::string const& eventId, std::string const& payload);
++    bool ReconcileJournalClaims();
++    [[nodiscard]] std::string const& GetJournalEventId() const { return journalEventId; }
++    uint32 JournalRewardIndex(LootItem const* item) const;
++    [[nodiscard]] Loot* GetPersonalLoot(ObjectGuid playerGuid);
++    [[nodiscard]] Loot const* GetPersonalLoot(ObjectGuid playerGuid) const;
+ 
+     void NotifyItemRemoved(uint8 lootIndex);
+     void NotifyQuestItemRemoved(uint8 questIndex);
+@@ -387,6 +411,19 @@ struct Loot
+     void FillNotNormalLootFor(Player* player);
+ 
+ private:
++    // Root containers own the independent results. Leaves never own other leaves.
++    std::map<ObjectGuid, std::unique_ptr<Loot>> personalLoot;
++    bool isPersonalLeaf{false};
++    bool personalMoney{false};
++    bool journalManaged{false};
++    bool journalCommitted{false};
++    std::string journalEventId;
++    std::string journalSourceKey;
++    uint32 journalAccountId{0};
++    uint64 journalCharacterCreatedAt{0};
++    uint16 journalLootMode{LOOT_MODE_DEFAULT};
++    std::vector<std::unique_ptr<Condition>> journalConditions;
++    Loot* sharedMoneySource{nullptr};
+     QuestItemList* FillFFALoot(Player* player);
+     QuestItemList* FillQuestLoot(Player* player);
+     QuestItemList* FillNonQuestNonFFAConditionalLoot(Player* player);
+diff --git a/src/server/game/Scripting/ScriptDefines/MiscScript.cpp b/src/server/game/Scripting/ScriptDefines/MiscScript.cpp
+index a41a3f0d9..f54bcab0d 100644
+--- a/src/server/game/Scripting/ScriptDefines/MiscScript.cpp
++++ b/src/server/game/Scripting/ScriptDefines/MiscScript.cpp
+@@ -99,6 +99,13 @@ void ScriptMgr::OnPlayerSetPhase(AuraEffect const* auraEff, AuraApplication cons
+     CALL_ENABLED_HOOKS(MiscScript, MISCHOOK_ON_PLAYER_SET_PHASE, script->OnPlayerSetPhase(auraEff, aurApp, mode, apply, newPhase));
+ }
+ 
++void ScriptMgr::OnSelectPersonalLootRecipients(WorldObject* source, Player* owner,
++    LootStore const& store, std::vector<Player*>& recipients)
++{
++    CALL_ENABLED_HOOKS(MiscScript, MISCHOOK_ON_SELECT_PERSONAL_LOOT_RECIPIENTS,
++        script->OnSelectPersonalLootRecipients(source, owner, store, recipients));
++}
++
+ void ScriptMgr::OnInstanceSave(InstanceSave* instanceSave)
+ {
+     CALL_ENABLED_HOOKS(MiscScript, MISCHOOK_ON_INSTANCE_SAVE, script->OnInstanceSave(instanceSave));
+diff --git a/src/server/game/Scripting/ScriptDefines/MiscScript.h b/src/server/game/Scripting/ScriptDefines/MiscScript.h
+index 9ed20ab23..260c8bfb7 100644
+--- a/src/server/game/Scripting/ScriptDefines/MiscScript.h
++++ b/src/server/game/Scripting/ScriptDefines/MiscScript.h
+@@ -42,6 +42,7 @@ enum MiscHook
+     MISCHOOK_ON_PLAYER_SET_PHASE,
+     MISCHOOK_ON_INSTANCE_SAVE,
+     MISCHOOK_GET_DIALOG_STATUS,
++    MISCHOOK_ON_SELECT_PERSONAL_LOOT_RECIPIENTS,
+     MISCHOOK_END
+ };
+ 
+@@ -83,6 +84,10 @@ public:
+ 
+     virtual void OnAfterLootTemplateProcess(Loot* /*loot*/, LootTemplate const* /*tab*/, LootStore const& /*store*/, Player* /*lootOwner*/, bool /*personal*/, bool /*noEmptyError*/, uint16 /*lootMode*/) { }
+ 
++    // An empty selection preserves stock generation. Pointers are used only within FillLoot.
++    virtual void OnSelectPersonalLootRecipients(WorldObject* /*source*/, Player* /*owner*/,
++        LootStore const& /*store*/, std::vector<Player*>& /*recipients*/) { }
++
+     virtual void OnPlayerSetPhase(AuraEffect const* /*auraEff*/, AuraApplication const* /*aurApp*/, uint8 /*mode*/, bool /*apply*/, uint32& /*newPhase*/) { }
+ 
+     virtual void OnInstanceSave(InstanceSave* /*instanceSave*/) { }
+diff --git a/src/server/game/Scripting/ScriptMgr.h b/src/server/game/Scripting/ScriptMgr.h
+index 72a8e103d..2fae25bbd 100644
+--- a/src/server/game/Scripting/ScriptMgr.h
++++ b/src/server/game/Scripting/ScriptMgr.h
+@@ -722,6 +722,8 @@ public: /* MiscScript */
+     void OnPlayerSetPhase(AuraEffect const* auraEff, AuraApplication const* aurApp, uint8 mode, bool apply, uint32& newPhase);
+     void ValidateSpellAtCastSpellResult(Player* player, Unit* mover, Spell* spell, uint32 oldSpellId, uint32 spellId);
+     void OnAfterLootTemplateProcess(Loot* loot, LootTemplate const* tab, LootStore const& store, Player* lootOwner, bool personal, bool noEmptyError, uint16 lootMode);
++    void OnSelectPersonalLootRecipients(WorldObject* source, Player* owner,
++        LootStore const& store, std::vector<Player*>& recipients);
+     void OnInstanceSave(InstanceSave* instanceSave);
+     void GetDialogStatus(Player* player, Object* questgiver);
+ 
+diff --git a/src/server/database/Database/CheckedTransaction.h b/src/server/database/Database/CheckedTransaction.h
+new file mode 100644
+index 000000000..466852539
+--- /dev/null
++++ b/src/server/database/Database/CheckedTransaction.h
+@@ -0,0 +1,35 @@
++/* Voxville persistence infrastructure, GNU AGPL v3. */
++#ifndef AC_CHECKED_TRANSACTION_H
++#define AC_CHECKED_TRANSACTION_H
++
++#include <string_view>
++
++enum class TransactionOutcome
++{
++    Committed,
++    RolledBack,
++    Unknown
++};
++
++// InnoDB DML only. Callbacks must never reconnect or replay statements.
++// Unknown requires reconciliation by a durable operation ID before retrying.
++template<class Control, class Statements>
++TransactionOutcome RunCheckedTransaction(Control&& control, Statements&& statements)
++{
++    if (!control(std::string_view("START TRANSACTION")))
++        return TransactionOutcome::Unknown;
++
++    if (!statements())
++        return control(std::string_view("ROLLBACK")) ?
++            TransactionOutcome::RolledBack : TransactionOutcome::Unknown;
++
++    if (control(std::string_view("COMMIT")))
++        return TransactionOutcome::Committed;
++
++    // COMMIT may have reached the server even if acknowledgement was lost.
++    // A successful subsequent rollback cannot establish that it did not commit.
++    control(std::string_view("ROLLBACK"));
++    return TransactionOutcome::Unknown;
++}
++
++#endif
+diff --git a/src/server/game/Loot/PersonalLootPersistence.cpp b/src/server/game/Loot/PersonalLootPersistence.cpp
+new file mode 100644
+index 000000000..b2c07435b
+--- /dev/null
++++ b/src/server/game/Loot/PersonalLootPersistence.cpp
+@@ -0,0 +1,918 @@
++/* Voxville durable personal loot; GNU AGPL v3 or later, matching the core. */
++#include "PersonalLootPersistence.h"
++#include "Bag.h"
++#include "CharacterCache.h"
++#include "CryptoRandom.h"
++#include "DatabaseEnv.h"
++#include "DBCStores.h"
++#include "GameTime.h"
++#include "Item.h"
++#include "Log.h"
++#include "LootMgr.h"
++#include "Mail.h"
++#include "MailMgr.h"
++#include "ObjectAccessor.h"
++#include "ObjectMgr.h"
++#include "Player.h"
++#include "PreparedStatement.h"
++#include "QueryResult.h"
++#include "ScriptMgr.h"
++#include "Transaction.h"
++#include "Util.h"
++#include "World.h"
++#include "WorldSession.h"
++#include <boost/bind/bind.hpp>
++#include <boost/bind/placeholders.hpp>
++#include <boost/property_tree/json_parser.hpp>
++#include <algorithm>
++#include <atomic>
++#include <limits>
++#include <mutex>
++#include <set>
++#include <sstream>
++
++namespace
++{
++    using Tree = boost::property_tree::ptree;
++    struct RecoveryCursor
++    {
++        std::string event = std::string(32, '0');
++        uint64 owner{0};
++        uint32 index{0};
++    };
++    std::mutex cursorMutex;
++    std::map<ObjectGuid, RecoveryCursor> recoveryCursors;
++    // Mode bits 0-1, minimum quality bits 2-4, gold bit 5, instances-only bit 6.
++    std::atomic<uint32> recoveryPolicy{1U | (3U << 2) | (1U << 5)};
++
++    bool MoneyFits(Player const* player, uint32 amount)
++    {
++        if (amount > MAX_MONEY_AMOUNT - player->GetMoney())
++            return false;
++        uint32 trial = sWorld->getIntConfig(CONFIG_TRIAL_MONEY_CAP);
++        return !trial || !player->GetSession()->IsTrialAccount() || player->GetMoney() + amount <= trial;
++    }
++
++    Tree Parse(std::string const& json)
++    {
++        Tree tree;
++        std::istringstream stream(json);
++        boost::property_tree::read_json(stream, tree);
++        return tree;
++    }
++
++    void DecodeMetadata(LootItem& item, Tree const& data, std::vector<std::unique_ptr<Condition>>& owned)
++    {
++        item.itemIndex = data.get<uint32>("itemIndex");
++        item.groupid = uint8(data.get<uint32>("group"));
++        for (auto const& entry : data.get_child("allowed"))
++            item.allowedGUIDs.insert(ObjectGuid(entry.second.get_value<uint64>()));
++        for (auto const& entry : data.get_child("conditions"))
++        {
++            std::vector<int64> values;
++            for (auto const& field : entry.second)
++                values.push_back(field.second.get_value<int64>());
++            if (values.size() != 15)
++                throw std::runtime_error("Invalid stored condition");
++            auto condition = std::make_unique<Condition>();
++            condition->SourceType = ConditionSourceType(values[0]);
++            condition->SourceGroup = uint32(values[1]);
++            condition->SourceEntry = int32(values[2]);
++            condition->SourceId = uint32(values[3]);
++            condition->ElseGroup = uint32(values[4]);
++            condition->ConditionType = ConditionTypes(values[5]);
++            condition->ConditionValue1 = uint32(values[6]);
++            condition->ConditionValue2 = uint32(values[7]);
++            condition->ConditionValue3 = uint32(values[8]);
++            condition->ErrorType = uint32(values[9]);
++            condition->ErrorTextId = uint32(values[10]);
++            condition->ReferenceId = uint32(values[11]);
++            condition->ScriptId = uint32(values[12]);
++            condition->ConditionTarget = uint8(values[13]);
++            condition->NegativeCondition = values[14] != 0;
++            item.conditions.push_back(condition.get());
++            owned.push_back(std::move(condition));
++        }
++    }
++
++    void DecodeFlags(LootItem& item, uint32 flags)
++    {
++        item.is_looted = flags & 1;
++        item.is_blocked = (flags >> 1) & 1;
++        item.freeforall = (flags >> 2) & 1;
++        item.is_underthreshold = (flags >> 3) & 1;
++        item.is_counted = (flags >> 4) & 1;
++        item.needs_quest = (flags >> 5) & 1;
++        item.follow_loot_rules = (flags >> 6) & 1;
++    }
++
++    void AppendClaim(CharacterDatabaseTransaction const& transaction, std::string const& event,
++        ObjectGuid owner, uint32 index, uint8 kind = 0, std::string const& delivery = {}, uint32 itemGuid = 0)
++    {
++        auto statement = CharacterDatabase.GetPreparedStatement(CHAR_PL_INS_CLAIM);
++        statement->SetData(0, index);
++        statement->SetData(1, kind);
++        if (delivery.empty())
++            statement->SetData(2, nullptr);
++        else
++            statement->SetData(2, delivery);
++        if (itemGuid)
++            statement->SetData(3, itemGuid);
++        else
++            statement->SetData(3, nullptr);
++        statement->SetData(4, uint64(GameTime::GetGameTime().count()));
++        statement->SetData(5, event);
++        statement->SetData(6, owner.GetRawValue());
++        statement->SetData(7, index);
++        transaction->Append(statement);
++        transaction->RequireLastAffectedRows(1);
++    }
++
++    std::unique_ptr<Item> CreateExactItem(LootItem const& reward, uint32 count, Player const* player)
++    {
++        auto item = std::unique_ptr<Item>(Item::CreateItem(reward.itemid, count, nullptr, true,
++            reward.randomPropertyId));
++        if (!item || item->GetCount() != count)
++            return nullptr;
++        if (reward.randomPropertyId < 0)
++            item->SetUInt32Value(ITEM_FIELD_PROPERTY_SEED, reward.randomSuffix);
++        auto bonding = item->GetTemplate()->Bonding;
++        if (bonding == BIND_WHEN_PICKED_UP || bonding == BIND_QUEST_ITEM)
++            item->SetBinding(true);
++        if (player)
++            item->SetOwnerGUID(player->GetGUID());
++        return item;
++    }
++}
++
++void Player::QuarantineJournalFailure()
++{
++    m_journalPersistenceFault = true;
++    LOG_ERROR("module.personal_loot", "Character {} disconnected after an uncertain inventory save/claim; "
++        "reload durable state before further play.", GetGUID().ToString());
++    GetSession()->KickPlayer("Personal loot persistence reconciliation");
++}
++
++bool Player::FlushJournalInventory()
++{
++    if (m_journalPersistenceFault || IsBeingTeleportedFar() || !CharacterDatabase.HasSingleAsyncWorker())
++        return false;
++    auto transaction = CharacterDatabase.BeginTransaction();
++    SaveInventoryAndGoldToDB(transaction);
++    if (CharacterDatabase.OrderedCommitCheckedTransaction(transaction) == TransactionOutcome::Committed)
++        return true;
++    QuarantineJournalFailure();
++    return false;
++}
++
++Item* Player::StoreJournalLootItem(Loot* loot, LootItem* reward, ItemPosCountVec const& dest,
++    uint32 recoveryMail, Item* original)
++{
++    if ((!original && (!loot || loot->GetJournalEventId().empty())) || !FlushJournalInventory())
++        return nullptr;
++    struct Placement
++    {
++        uint16 position;
++        uint32 count;
++        Item* stack;
++        uint32 flags;
++        std::unique_ptr<Item> created;
++    };
++    std::vector<Placement> placements;
++    auto transaction = CharacterDatabase.BeginTransaction();
++    if (original)
++    {
++        auto statement = CharacterDatabase.GetPreparedStatement(CHAR_PL_DEL_MAIL_ITEM);
++        statement->SetData(0, recoveryMail);
++        statement->SetData(1, original->GetGUID().GetCounter());
++        statement->SetData(2, GetGUID().GetCounter());
++        transaction->Append(statement);
++        transaction->RequireLastAffectedRows(1);
++        statement = CharacterDatabase.GetPreparedStatement(CHAR_DEL_ITEM_INSTANCE);
++        statement->SetData(0, original->GetGUID().GetCounter());
++        transaction->Append(statement);
++        transaction->RequireLastAffectedRows(1);
++        statement = CharacterDatabase.GetPreparedStatement(CHAR_PL_UPD_MAIL_ITEMS);
++        statement->SetData(0, recoveryMail);
++        statement->SetData(1, recoveryMail);
++        statement->SetData(2, GetGUID().GetCounter());
++        transaction->Append(statement);
++    }
++    else
++        AppendClaim(transaction, loot->GetJournalEventId(), GetGUID(), loot->JournalRewardIndex(reward));
++    for (auto const& destination : dest)
++    {
++        uint8 bagSlot = destination.pos >> 8;
++        uint8 slot = destination.pos & 255;
++        Item* stack = GetItemByPos(bagSlot, slot);
++        if (stack)
++        {
++            uint32 flags = stack->GetUInt32Value(ITEM_FIELD_FLAGS);
++            if (stack->GetTemplate()->Bonding == BIND_WHEN_PICKED_UP ||
++                stack->GetTemplate()->Bonding == BIND_QUEST_ITEM)
++                flags |= ITEM_FIELD_FLAG_SOULBOUND;
++            auto statement = CharacterDatabase.GetPreparedStatement(CHAR_PL_UPD_STACK);
++            statement->SetData(0, destination.count);
++            statement->SetData(1, flags);
++            statement->SetData(2, stack->GetGUID().GetCounter());
++            statement->SetData(3, GetGUID().GetRawValue());
++            statement->SetData(4, stack->GetCount());
++            transaction->Append(statement);
++            transaction->RequireLastAffectedRows(1);
++            placements.push_back({destination.pos, destination.count, stack, flags, nullptr});
++            continue;
++        }
++        auto created = CreateExactItem(*reward, destination.count, this);
++        if (!created)
++            return nullptr;
++        if (original)
++        {
++            for (uint32 field = OBJECT_END; field < ITEM_END; ++field)
++                created->SetUInt32Value(field, original->GetUInt32Value(field));
++            created->SetCount(destination.count);
++            created->SetOwnerGUID(GetGUID());
++        }
++        AllowedLooterSet looters = reward->GetAllowedLooters();
++        if (looters.size() > 1 && created->GetTemplate()->GetMaxStackSize() == 1 && created->IsSoulBound() &&
++            sWorld->getBoolConfig(CONFIG_SET_BOP_ITEM_TRADEABLE))
++        {
++            created->SetSoulboundTradeable(looters);
++            created->SetUInt32Value(ITEM_FIELD_CREATE_PLAYED_TIME, GetTotalPlayedTime());
++            std::ostringstream allowed;
++            for (ObjectGuid guid : looters)
++                allowed << guid.GetCounter() << ' ';
++            auto trade = CharacterDatabase.GetPreparedStatement(CHAR_INS_ITEM_BOP_TRADE);
++            trade->SetData(0, created->GetGUID().GetCounter());
++            trade->SetData(1, allowed.str());
++            transaction->Append(trade);
++        }
++        created->SaveToDBInsertOnly(transaction);
++        transaction->RequireLastAffectedRows(1);
++        uint32 container = bagSlot == INVENTORY_SLOT_BAG_0 ? 0 : GetBagByPos(bagSlot)->GetGUID().GetCounter();
++        auto statement = CharacterDatabase.GetPreparedStatement(CHAR_PL_INS_INVENTORY);
++        statement->SetData(0, GetGUID().GetRawValue());
++        statement->SetData(1, container);
++        statement->SetData(2, slot);
++        statement->SetData(3, created->GetGUID().GetCounter());
++        statement->SetData(4, GetGUID().GetRawValue());
++        statement->SetData(5, container);
++        statement->SetData(6, slot);
++        transaction->Append(statement);
++        transaction->RequireLastAffectedRows(1);
++        placements.push_back({destination.pos, destination.count, nullptr, 0, std::move(created)});
++    }
++    TransactionOutcome outcome = CharacterDatabase.OrderedCommitCheckedTransaction(transaction);
++    if (outcome != TransactionOutcome::Committed)
++    {
++        if (outcome == TransactionOutcome::Unknown)
++            QuarantineJournalFailure();
++        return nullptr;
++    }
++    Item* last = nullptr;
++    for (auto& placement : placements)
++    {
++        if (placement.stack)
++        {
++            last = placement.stack;
++            last->SetCount(last->GetCount() + placement.count);
++            last->SetUInt32Value(ITEM_FIELD_FLAGS, placement.flags);
++            last->SetState(ITEM_CHANGED, this);
++            last->SendUpdateToPlayer(this);
++        }
++        else
++        {
++            last = _StoreItem(placement.position, placement.created.release(), placement.count, false, true);
++            if (last->IsBOPTradable())
++                AddTradeableItem(last);
++        }
++    }
++    ItemAddedQuestCheck(reward->itemid, reward->count);
++    UpdateAchievementCriteria(ACHIEVEMENT_CRITERIA_TYPE_RECEIVE_EPIC_ITEM, reward->itemid, reward->count);
++    UpdateAchievementCriteria(ACHIEVEMENT_CRITERIA_TYPE_OWN_ITEM, reward->itemid, reward->count);
++    if (original)
++    {
++        GetMail(recoveryMail)->RemoveItem(original->GetGUID().GetCounter());
++        RemoveMItem(original->GetGUID().GetCounter());
++        delete original;
++        sScriptMgr->OnPlayerAfterMoveItemToInventory(this, last, true);
++    }
++    else
++        sScriptMgr->OnPlayerStoreNewItem(this, last, reward->count);
++    return last;
++}
++
++bool Player::ClaimJournalGold(Loot* loot, uint32 amount)
++{
++    if (!loot->gold)
++        return true;
++    if (!MoneyFits(this, amount) || loot->GetJournalEventId().empty() || !FlushJournalInventory())
++        return false;
++    auto transaction = CharacterDatabase.BeginTransaction();
++    AppendClaim(transaction, loot->GetJournalEventId(), GetGUID(),
++        uint32(loot->items.size() + loot->quest_items.size()));
++    if (amount)
++    {
++        auto statement = CharacterDatabase.GetPreparedStatement(CHAR_PL_UPD_GOLD);
++        statement->SetData(0, amount);
++        statement->SetData(1, GetGUID().GetRawValue());
++        statement->SetData(2, GetMoney());
++        transaction->Append(statement);
++        transaction->RequireLastAffectedRows(1);
++    }
++    TransactionOutcome outcome = CharacterDatabase.OrderedCommitCheckedTransaction(transaction);
++    if (outcome == TransactionOutcome::Unknown)
++        QuarantineJournalFailure();
++    if (outcome != TransactionOutcome::Committed)
++        return false;
++    SetMoney(GetMoney() + amount);
++    return true;
++}
++
++bool Player::ClaimRecoveryMailGold(uint32 mail, uint32 amount)
++{
++    if (!amount || !MoneyFits(this, amount) || !FlushJournalInventory())
++        return false;
++    auto transaction = CharacterDatabase.BeginTransaction();
++    auto statement = CharacterDatabase.GetPreparedStatement(CHAR_PL_CLEAR_MAIL_GOLD);
++    statement->SetData(0, mail);
++    statement->SetData(1, GetGUID().GetCounter());
++    statement->SetData(2, amount);
++    transaction->Append(statement);
++    transaction->RequireLastAffectedRows(1);
++    statement = CharacterDatabase.GetPreparedStatement(CHAR_PL_UPD_GOLD);
++    statement->SetData(0, amount);
++    statement->SetData(1, GetGUID().GetRawValue());
++    statement->SetData(2, GetMoney());
++    transaction->Append(statement);
++    transaction->RequireLastAffectedRows(1);
++    TransactionOutcome outcome = CharacterDatabase.OrderedCommitCheckedTransaction(transaction);
++    if (outcome == TransactionOutcome::Unknown)
++        QuarantineJournalFailure();
++    if (outcome != TransactionOutcome::Committed)
++        return false;
++    SetMoney(GetMoney() + amount);
++    GetMail(mail)->money = 0;
++    return true;
++}
++
++uint32 Loot::JournalRewardIndex(LootItem const* item) const
++{
++    for (uint32 index = 0; index < items.size(); ++index)
++        if (&items[index] == item)
++            return index;
++    for (uint32 index = 0; index < quest_items.size(); ++index)
++        if (&quest_items[index] == item)
++            return uint32(items.size()) + index;
++    throw std::logic_error("Item is not part of journal loot");
++}
++
++void Loot::AbandonJournal()
++{
++    if (!isPersonalLeaf && journalManaged && journalCommitted && !journalEventId.empty())
++    {
++        auto statement = CharacterDatabase.GetPreparedStatement(CHAR_PL_MARK_ORPHAN);
++        statement->SetData(0, journalEventId);
++        CharacterDatabase.Execute(statement);
++    }
++}
++
++bool Loot::RestoreJournal(std::string const& eventId, std::string const& payload)
++{
++    try
++    {
++        Tree data = Parse(payload);
++        if (data.get<uint32>("version") != 1 || !data.get<bool>("personalGold"))
++            return false;
++        decltype(personalLoot) restored;
++        for (auto const& entry : data.get_child("recipients"))
++        {
++            if (restored.size() >= 40)
++                throw std::runtime_error("Too many stored recipients");
++            auto leaf = std::make_unique<Loot>();
++            leaf->isPersonalLeaf = true;
++            leaf->journalManaged = true;
++            leaf->journalCommitted = true;
++            leaf->journalEventId = eventId;
++            leaf->sourceWorldObjectGUID = sourceWorldObjectGUID;
++            leaf->sourceGameObject = sourceGameObject;
++            leaf->gold = entry.second.get<uint32>("gold");
++            leaf->unlootedCount = uint8(entry.second.get<uint32>("unlooted"));
++            ObjectGuid guid(entry.second.get<uint64>("guid"));
++            for (auto const& stored : entry.second.get_child("items"))
++            {
++                LootItem item{};
++                item.itemid = stored.second.get<uint32>("id");
++                item.count = uint8(stored.second.get<uint32>("count"));
++                item.randomPropertyId = stored.second.get<int32>("property");
++                item.randomSuffix = stored.second.get<uint32>("suffix");
++                item.rollWinnerGUID = ObjectGuid(stored.second.get<uint64>("rollWinner", 0));
++                DecodeFlags(item, stored.second.get<uint32>("flags"));
++                DecodeMetadata(item, stored.second.get_child("metadata"), leaf->journalConditions);
++                bool quest = stored.second.get<bool>("questRow");
++                auto& list = quest ? leaf->quest_items : leaf->items;
++                if (!sObjectMgr->GetItemTemplate(item.itemid) || !item.count ||
++                    list.size() >= (quest ? MAX_NR_QUEST_ITEMS : MAX_NR_LOOT_ITEMS))
++                    throw std::runtime_error("Invalid stored item");
++                list.push_back(std::move(item));
++            }
++            auto tracking = [&](char const* key, QuestItemMap& destination, std::size_t itemCount)
++            {
++                for (auto const& stored : entry.second.get_child(key))
++                {
++                    ObjectGuid owner(stored.second.get<uint64>("guid"));
++                    uint32 index = stored.second.get<uint32>("index");
++                    if (owner != guid || index >= itemCount)
++                        throw std::runtime_error("Invalid stored loot tracking");
++                    if (!destination.contains(owner))
++                        destination[owner] = new QuestItemList();
++                    destination[owner]->emplace_back(uint8(index),
++                        stored.second.get<bool>("looted"));
++                }
++            };
++            tracking("questTracking", leaf->PlayerQuestItems, leaf->quest_items.size());
++            tracking("ffaTracking", leaf->PlayerFFAItems, leaf->items.size());
++            tracking("conditionalTracking", leaf->PlayerNonQuestNonFFAConditionalItems, leaf->items.size());
++            if (!restored.emplace(guid, std::move(leaf)).second)
++                throw std::runtime_error("Duplicate stored recipient");
++        }
++        personalLoot = std::move(restored);
++        personalMoney = true;
++        journalManaged = true;
++        journalCommitted = true;
++        journalEventId = eventId;
++        gold = data.get<uint32>("rootGold");
++        lootOwnerGUID = ObjectGuid(data.get<uint64>("rootOwner"));
++        return ReconcileJournalClaims();
++    }
++    catch (std::exception const& error)
++    {
++        LOG_ERROR("module.personal_loot", "Cannot restore event {}: {}", eventId, error.what());
++        return false;
++    }
++}
++
++bool Loot::ReconcileJournalClaims()
++{
++    auto statement = CharacterDatabase.GetPreparedStatement(CHAR_PL_SEL_CLAIMS);
++    statement->SetData(0, journalEventId);
++    statement->SetData(1, journalEventId);
++    auto claims = CharacterDatabase.Query(statement);
++    if (!claims)
++        return false;
++    do
++    {
++        Field* row = claims->Fetch();
++        auto leaf = personalLoot.find(ObjectGuid(row[0].Get<uint64>()));
++        if (leaf == personalLoot.end())
++            continue;
++        Loot& result = *leaf->second;
++        uint32 index = row[1].Get<uint32>();
++        if (index == result.items.size() + result.quest_items.size())
++        {
++            result.gold = 0;
++            continue;
++        }
++        bool quest = index >= result.items.size();
++        uint32 position = quest ? index - uint32(result.items.size()) : index;
++        auto& items = quest ? result.quest_items : result.items;
++        if (position >= items.size() || items[position].is_looted)
++            continue;
++        items[position].is_looted = true;
++        if (result.unlootedCount)
++            --result.unlootedCount;
++        auto mark = [&](QuestItemMap& tracking)
++        {
++            for (auto const& [guid, list] : tracking)
++                for (QuestItem& item : *list)
++                    if (item.index == position)
++                        item.is_looted = true;
++        };
++        if (quest)
++            mark(result.PlayerQuestItems);
++        else
++        {
++            mark(result.PlayerFFAItems);
++            mark(result.PlayerNonQuestNonFFAConditionalItems);
++        }
++    } while (claims->NextRow());
++    return true;
++}
++
++namespace
++{
++    struct PendingReward
++    {
++        PendingReward() = default;
++        PendingReward(PendingReward const&) = delete;
++        PendingReward& operator=(PendingReward const&) = delete;
++        PendingReward(PendingReward&&) = default;
++        PendingReward& operator=(PendingReward&&) = default;
++        std::string event;
++        ObjectGuid owner;
++        uint32 index;
++        uint8 kind;
++        uint64 quantity;
++        bool dungeon{false};
++        LootItem item{};
++        std::vector<std::unique_ptr<Condition>> conditions;
++    };
++
++    bool ShouldMail(PendingReward const& reward, uint32 policy)
++    {
++        uint32 mode = policy & 3U;
++        if (!mode || ((mode == 3 || (policy & (1U << 6))) && !reward.dungeon))
++            return false;
++        if (reward.kind == 1)
++            return mode != 3 && (policy & (1U << 5));
++        auto proto = sObjectMgr->GetItemTemplate(reward.item.itemid);
++        if (!proto || (mode >= 2 && proto->Quality < ((policy >> 2) & 7U)))
++            return false;
++        // This profile approximates Postmaster behavior; it is not a retail compatibility claim.
++        return mode != 3 || (!reward.item.needs_quest && proto->Bonding != BIND_QUEST_ITEM &&
++            proto->Bonding != BIND_WHEN_EQUIPPED && !proto->IsCurrencyToken());
++    }
++
++    void SynchronizeMailbox(Player* player)
++    {
++        std::set<uint32> known;
++        for (Mail const* mail : player->GetMails())
++            known.insert(mail->messageID);
++        bool added = false;
++        auto statement = CharacterDatabase.GetPreparedStatement(CHAR_PL_SEL_RECOVERY_MAIL);
++        statement->SetData(0, player->GetGUID().GetRawValue());
++        auto result = CharacterDatabase.Query(statement);
++        if (!result)
++            return;
++        do
++        {
++            Field* fields = result->Fetch();
++            uint32 id = fields[0].Get<uint32>();
++            if (known.contains(id))
++                continue;
++            auto mail = std::make_unique<Mail>();
++            mail->messageID = id;
++            mail->messageType = fields[1].Get<uint8>();
++            mail->sender = fields[2].Get<uint32>();
++            mail->receiver = fields[3].Get<uint32>();
++            mail->subject = fields[4].Get<std::string>();
++            mail->body = fields[5].Get<std::string>();
++            mail->expire_time = fields[6].Get<uint32>();
++            mail->deliver_time = fields[7].Get<uint32>();
++            mail->money = fields[8].Get<uint32>();
++            mail->COD = fields[9].Get<uint32>();
++            mail->checked = fields[10].Get<uint8>();
++            mail->stationery = fields[11].Get<uint8>();
++            mail->mailTemplateId = fields[12].Get<uint16>();
++            mail->state = MAIL_STATE_UNCHANGED;
++            std::vector<std::unique_ptr<Item>> items;
++            bool complete = true;
++            statement = CharacterDatabase.GetPreparedStatement(CHAR_PL_SEL_RECOVERY_ITEMS);
++            statement->SetData(0, id);
++            statement->SetData(1, player->GetGUID().GetRawValue());
++            if (auto stored = CharacterDatabase.Query(statement))
++                do
++                {
++                    Field* itemRow = stored->Fetch();
++                    uint32 entry = itemRow[12].Get<uint32>();
++                    auto proto = sObjectMgr->GetItemTemplate(entry);
++                    if (!proto)
++                    {
++                        complete = false;
++                        continue;
++                    }
++                    auto item = std::unique_ptr<Item>(NewItemOrBag(proto));
++                    if (item->LoadFromDB(itemRow[11].Get<uint32>(), player->GetGUID(), itemRow, entry))
++                    {
++                        mail->AddItem(item->GetGUID().GetCounter(), entry);
++                        items.push_back(std::move(item));
++                    }
++                    else
++                        complete = false;
++                } while (stored->NextRow());
++            // A failed attachment read must not publish a permanently incomplete inbox entry.
++            if (!complete || (fields[13].Get<bool>() && items.empty()))
++                continue;
++            time_t deliver = mail->deliver_time;
++            player->AddMail(mail.release());
++            for (auto& item : items)
++                player->AddMItem(item.release());
++            player->AddNewMailDeliverTime(deliver);
++            added = true;
++        } while (result->NextRow());
++        if (added)
++            sMailMgr->RecountMailCount(player->GetGUID().GetCounter());
++    }
++
++    bool Deliver(std::vector<PendingReward>& rewards, Player* player, uint32 policy)
++    {
++        if (rewards.empty() || (player && !player->FlushJournalInventory()))
++            return false;
++        ObjectGuid owner = rewards.front().owner;
++        std::map<uint32, uint64> counts;
++        std::map<uint32, uint64> categories;
++        if (player)
++        {
++            auto statement = CharacterDatabase.GetPreparedStatement(CHAR_PL_SEL_OWNED_COUNTS);
++            statement->SetData(0, owner.GetRawValue());
++            auto owned = CharacterDatabase.Query(statement);
++            if (!owned)
++                return false;
++            do
++            {
++                uint32 entry = uint32(owned->Fetch()[0].Get<uint64>());
++                uint64 count = owned->Fetch()[1].Get<uint64>();
++                counts[entry] = count;
++                if (auto proto = sObjectMgr->GetItemTemplate(entry))
++                    categories[proto->ItemLimitCategory] += count;
++            } while (owned->NextRow());
++        }
++        struct Envelope
++        {
++            uint32 id;
++            std::string delivery;
++            uint32 money{0};
++            std::vector<std::unique_ptr<Item>> items;
++        };
++        std::vector<Envelope> envelopes;
++        auto envelope = [&]() -> Envelope&
++        {
++            if (envelopes.empty() || envelopes.back().items.size() == MAX_MAIL_ITEMS)
++                envelopes.push_back({sObjectMgr->GenerateMailID(),
++                    ByteArrayToHexStr(Acore::Crypto::GetRandomBytes<16>()), 0, {}});
++            return envelopes.back();
++        };
++        std::vector<std::pair<PendingReward*, std::string>> selected;
++        uint32 claimed = 0;
++        for (auto& reward : rewards)
++        {
++            if (!ShouldMail(reward, policy))
++                continue;
++            if (reward.kind == 1)
++            {
++                if (reward.quantity > std::numeric_limits<uint32>::max())
++                    continue;
++                std::string delivery = envelope().delivery;
++                uint64 remaining = reward.quantity;
++                if (player && player->HasPlayerFlag(PLAYER_FLAGS_PARTIAL_PLAY_TIME))
++                    remaining /= 2;
++                while (remaining)
++                {
++                    if (envelope().money == MAX_MONEY_AMOUNT)
++                        envelopes.push_back({sObjectMgr->GenerateMailID(),
++                            ByteArrayToHexStr(Acore::Crypto::GetRandomBytes<16>()), 0, {}});
++                    uint32 amount = uint32(std::min<uint64>(remaining, MAX_MONEY_AMOUNT - envelopes.back().money));
++                    envelopes.back().money += amount;
++                    remaining -= amount;
++                }
++                selected.emplace_back(&reward, delivery);
++                ++claimed;
++                continue;
++            }
++            auto proto = sObjectMgr->GetItemTemplate(reward.item.itemid);
++            if (!proto || reward.quantity > 255)
++                continue;
++            if (!player && (reward.item.needs_quest || !reward.item.conditions.empty() ||
++                proto->MaxCount > 0 || proto->ItemLimitCategory))
++                continue; // Evaluate quest/conditional/unique eligibility on that character's map thread.
++            if (player && (!reward.item.AllowedForPlayer(player, ObjectGuid::Empty) ||
++                player->CanTakeMoreSimilarItems(reward.item.itemid, uint32(reward.quantity)) != EQUIP_ERR_OK))
++                continue;
++            if (player && proto->MaxCount > 0 &&
++                counts[reward.item.itemid] + reward.quantity > uint32(proto->MaxCount))
++                continue;
++            if (player && proto->ItemLimitCategory)
++            {
++                auto limit = sItemLimitCategoryStore.LookupEntry(proto->ItemLimitCategory);
++                if (!limit || (limit->mode == ITEM_LIMIT_CATEGORY_MODE_HAVE &&
++                    categories[proto->ItemLimitCategory] + reward.quantity > limit->maxCount))
++                    continue;
++            }
++            std::string delivery = envelope().delivery;
++            uint32 remaining = uint32(reward.quantity);
++            while (remaining)
++            {
++                uint32 count = std::min(remaining, proto->GetMaxStackSize());
++                auto item = CreateExactItem(reward.item, count, player);
++                if (!item)
++                    return false;
++                item->SetOwnerGUID(owner);
++                envelope().items.push_back(std::move(item));
++                remaining -= count;
++            }
++            selected.emplace_back(&reward, delivery);
++            counts[reward.item.itemid] += reward.quantity;
++            categories[proto->ItemLimitCategory] += reward.quantity;
++            ++claimed;
++        }
++        if (!claimed)
++            return false;
++        uint32 now = uint32(GameTime::GetGameTime().count());
++        // Outbox ownership rows precede claims because the schema checks the composite FK immediately.
++        // Build a fresh transaction so all delivery guards exist before their claims.
++        auto final = CharacterDatabase.BeginTransaction();
++        for (auto& mail : envelopes)
++        {
++            auto statement = CharacterDatabase.GetPreparedStatement(CHAR_INS_MAIL);
++            statement->SetData(0, mail.id);
++            statement->SetData(1, uint8(MAIL_NORMAL));
++            statement->SetData(2, uint8(MAIL_STATIONERY_GM));
++            statement->SetData(3, uint16(0));
++            statement->SetData(4, uint32(0));
++            statement->SetData(5, owner.GetCounter());
++            statement->SetData(6, std::string("Recovered personal loot"));
++            statement->SetData(7, std::string("Your uncollected personal rewards were saved and recovered. ") +
++                "Each reward belongs only to this character.");
++            statement->SetData(8, !mail.items.empty());
++            statement->SetData(9, std::numeric_limits<uint32>::max());
++            statement->SetData(10, now);
++            statement->SetData(11, mail.money);
++            statement->SetData(12, uint32(0));
++            statement->SetData(13, uint8(MAIL_CHECK_MASK_COPIED));
++            final->Append(statement);
++            auto delivery = CharacterDatabase.GetPreparedStatement(CHAR_PL_INS_DELIVERY);
++            delivery->SetData(0, mail.delivery);
++            delivery->SetData(1, owner.GetRawValue());
++            delivery->SetData(2, mail.id);
++            delivery->SetData(3, uint64(now));
++            delivery->SetData(4, uint64(now));
++            final->Append(delivery);
++            for (auto& item : mail.items)
++            {
++                item->SaveToDBInsertOnly(final);
++                final->RequireLastAffectedRows(1);
++                statement = CharacterDatabase.GetPreparedStatement(CHAR_INS_MAIL_ITEM);
++                statement->SetData(0, mail.id);
++                statement->SetData(1, item->GetGUID().GetCounter());
++                statement->SetData(2, owner.GetCounter());
++                final->Append(statement);
++            }
++        }
++        // Move prepared claim guards without replaying or rewriting their immutable identities.
++        for (auto const& [reward, delivery] : selected)
++            AppendClaim(final, reward->event, owner, reward->index, 1, delivery);
++        TransactionOutcome outcome = CharacterDatabase.OrderedCommitCheckedTransaction(final);
++        if (outcome == TransactionOutcome::Committed)
++        {
++            for (auto const& mail : envelopes)
++                sMailMgr->OnMailSent(owner.GetCounter());
++            LOG_DEBUG("module.personal_loot", "Recovered {} reward rows for {} into {} mail(s).",
++                claimed, owner.ToString(), envelopes.size());
++            return true;
++        }
++        // A retry selects only rows without durable claims, so an unknown commit cannot create another award.
++        LOG_ERROR("module.personal_loot", "Recovery mail outcome unconfirmed for {}; outcome={}",
++            owner.ToString(), uint32(outcome));
++        return false;
++    }
++
++    void Recover(Player* player)
++    {
++        uint32 policy = recoveryPolicy.load(std::memory_order_relaxed);
++        if (!(policy & 3U))
++            return;
++        if (!Loot::GenerationJournalEnabled() || !CharacterDatabase.HasSingleAsyncWorker())
++            return;
++        if (player && (player->HasJournalPersistenceFault() || !player->IsInWorld() ||
++            player->HasPlayerFlag(PLAYER_FLAGS_NO_PLAY_TIME)))
++            return;
++        auto statement = CharacterDatabase.GetPreparedStatement(
++            player ? CHAR_PL_SEL_PENDING_PLAYER : CHAR_PL_SEL_PENDING);
++        ObjectGuid cursorKey = player ? player->GetGUID() : ObjectGuid::Empty;
++        RecoveryCursor cursor;
++        {
++            std::lock_guard<std::mutex> guard(cursorMutex);
++            cursor = recoveryCursors[cursorKey];
++        }
++        if (player)
++        {
++            statement->SetData(0, player->GetGUID().GetRawValue());
++            statement->SetData(1, cursor.event);
++            statement->SetData(2, cursor.index);
++        }
++        else
++        {
++            statement->SetData(0, cursor.event);
++            statement->SetData(1, cursor.owner);
++            statement->SetData(2, cursor.index);
++        }
++        auto pending = CharacterDatabase.Query(statement);
++        if (!pending)
++        {
++            std::lock_guard<std::mutex> guard(cursorMutex);
++            recoveryCursors[cursorKey] = RecoveryCursor{};
++            return;
++        }
++        std::map<std::pair<std::string, uint64>, std::vector<PendingReward>> groups;
++        do
++        {
++            Field* row = pending->Fetch();
++            ObjectGuid owner(row[1].Get<uint64>());
++            cursor = {row[0].Get<std::string>(), owner.GetRawValue(), row[2].Get<uint32>()};
++            if (!player && ObjectAccessor::FindConnectedPlayer(owner))
++                continue;
++            if (!player && (row[10].Get<uint32>() & (PLAYER_FLAGS_NO_PLAY_TIME | PLAYER_FLAGS_PARTIAL_PLAY_TIME)))
++                continue;
++            try
++            {
++                PendingReward reward;
++                reward.event = row[0].Get<std::string>();
++                reward.owner = owner;
++                reward.index = row[2].Get<uint32>();
++                reward.kind = row[3].Get<uint8>();
++                reward.quantity = row[5].Get<uint64>();
++                if (auto map = sMapStore.LookupEntry(row[11].Get<uint16>()))
++                    reward.dungeon = row[12].Get<uint32>() != 0 && map->IsDungeon();
++                if (reward.kind == 0)
++                {
++                    reward.item.itemid = row[4].Get<uint32>();
++                    reward.item.count = uint8(reward.quantity);
++                    reward.item.randomPropertyId = row[6].Get<int32>();
++                    reward.item.randomSuffix = row[7].Get<uint32>();
++                    DecodeFlags(reward.item, row[8].Get<uint32>());
++                    DecodeMetadata(reward.item, Parse(row[9].Get<std::string>()), reward.conditions);
++                }
++                // Skip filtered rows before baseline inventory saves or per-event ownership queries.
++                if (ShouldMail(reward, policy))
++                    groups[{reward.event, owner.GetRawValue()}].push_back(std::move(reward));
++            }
++            catch (std::exception const& error)
++            {
++                LOG_ERROR("module.personal_loot", "Invalid pending reward for {}: {}", owner.ToString(), error.what());
++            }
++        } while (pending->NextRow());
++        {
++            std::lock_guard<std::mutex> guard(cursorMutex);
++            recoveryCursors[cursorKey] = cursor;
++        }
++        for (auto& [key, rewards] : groups)
++            Deliver(rewards, player, policy);
++    }
++}
++
++void PersonalLootPersistence::ConfigureRecovery(uint32 mode, uint32 minQuality, bool gold, bool instancesOnly)
++{
++    if (mode > 3 || minQuality > 7)
++    {
++        LOG_ERROR("module.personal_loot", "Invalid recovery settings; previous recovery policy retained.");
++        return;
++    }
++    recoveryPolicy.store(mode | (minQuality << 2) | (uint32(gold) << 5) | (uint32(instancesOnly) << 6),
++        std::memory_order_relaxed);
++    LOG_INFO("module.personal_loot", "Recovery mail: mode={}, minQuality={}, gold={}, instancesOnly={}",
++        mode, minQuality, mode != 3 && gold, mode == 3 || instancesOnly);
++}
++
++void PersonalLootPersistence::RecoverStartup()
++{
++    if (!Loot::GenerationJournalEnabled())
++        return;
++    auto transaction = CharacterDatabase.BeginTransaction();
++    transaction->Append(CharacterDatabase.GetPreparedStatement(CHAR_PL_ORPHAN_ALL));
++    if (CharacterDatabase.OrderedCommitCheckedTransaction(transaction) != TransactionOutcome::Committed)
++    {
++        LOG_FATAL("module.personal_loot", "Could not establish startup loot recovery state.");
++        throw std::runtime_error("Personal loot startup reconciliation failed");
++    }
++    Recover(nullptr);
++}
++
++void PersonalLootPersistence::RecoverOffline()
++{
++    Recover(nullptr);
++}
++
++void PersonalLootPersistence::RecoverPlayer(Player* player)
++{
++    Recover(player);
++    SynchronizeMailbox(player);
++}
++
++int PersonalLootPersistence::RecoveryMailStatus(Player* player, uint32 id)
++{
++    if (!Loot::GenerationJournalEnabled())
++        return 0;
++    auto statement = CharacterDatabase.GetPreparedStatement(CHAR_PL_MAIL_STATUS);
++    statement->SetData(0, id);
++    statement->SetData(1, player->GetGUID().GetRawValue());
++    auto result = CharacterDatabase.Query(statement);
++    return result ? int(result->Fetch()[0].Get<uint8>()) : -1;
++}
++
++void PersonalLootPersistence::ForgetPlayer(Player* player)
++{
++    std::lock_guard<std::mutex> guard(cursorMutex);
++    recoveryCursors.erase(player->GetGUID());
++}
++
++void Player::UpdateJournalRecovery(uint32 diff)
++{
++    if (!Loot::GenerationJournalEnabled() || m_journalPersistenceFault)
++        return;
++    if (m_journalRecoveryTimer > diff)
++    {
++        m_journalRecoveryTimer -= diff;
++        return;
++    }
++    m_journalRecoveryTimer = 15000;
++    PersonalLootPersistence::RecoverPlayer(this);
++}
+diff --git a/src/server/game/Loot/PersonalLootPersistence.h b/src/server/game/Loot/PersonalLootPersistence.h
+new file mode 100644
+index 000000000..fee8c49e0
+--- /dev/null
++++ b/src/server/game/Loot/PersonalLootPersistence.h
+@@ -0,0 +1,17 @@
++#ifndef ACORE_PERSONAL_LOOT_PERSISTENCE_H
++#define ACORE_PERSONAL_LOOT_PERSISTENCE_H
++
++class Player;
++#include "Define.h"
++
++namespace PersonalLootPersistence
++{
++    void ConfigureRecovery(uint32 mode, uint32 minQuality, bool gold, bool instancesOnly);
++    void RecoverStartup();
++    void RecoverOffline();
++    void RecoverPlayer(Player* player);
++    int RecoveryMailStatus(Player* player, uint32 id);
++    void ForgetPlayer(Player* player);
++}
++
++#endif

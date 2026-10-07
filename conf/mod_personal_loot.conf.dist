@@ -1,0 +1,64 @@
+# Independent personal loot. Experimental; disabled by default.
+# Without GenerationJournal, unclaimed results can be lost on restart or despawn.
+PersonalLoot.Enable = 0
+
+# A second explicit gate prevents accidental activation during development.
+PersonalLoot.AllowExperimental = 0
+
+# Characters controlled by Playerbots are excluded by default.
+PersonalLoot.EnableForPlayerBots = 0
+
+# Applies to all creature corpse loot when enabled, including the open world.
+# Encounter-owned boss chests use the core's captured allowed-looter GUIDs.
+# Ordinary world treasure chests have their own optional setting below.
+# Gathering, fishing, skinning, pickpocketing and item containers retain stock behavior.
+PersonalLoot.BossChests = 1
+
+# Optional ordinary treasure chests outside instances. Default off retains party rolls.
+# The first opening freezes the opener and eligible nearby party members as recipients.
+# Reopening or changing parties does not add recipients or reroll existing loot.
+# Excludes profession gathering nodes, quest-specific chests and generic instance chests.
+# Gold follows PersonalGold; recovery follows the configured recovery filters.
+# Requires restart while GenerationJournal is enabled.
+PersonalLoot.WorldChests = 0
+
+# Built-in area looting; do not also enable unmodified mod-aoe-loot.
+# Collects items and gold. Inventory and quest checks apply; full bags retain items.
+PersonalLoot.AreaLoot = 0
+
+# Collection radius in yards, clamped to 5-50. At most 50 nearby corpses per opening.
+PersonalLoot.AreaLootRange = 30.0
+
+# Each personal-loot recipient gets an independent gold roll at stock money rates.
+# Disabled: retain stock shared gold. Changes apply to newly generated loot.
+PersonalLoot.PersonalGold = 0
+
+# Durable exact rewards, guarded claims, and automatic recovery mail.
+# Install the module's character-database SQL before enabling; restart required.
+# Requires Enable=1, AllowExperimental=1, PersonalGold=1 and
+# CharacterDatabase.WorkerThreads=1. Back up the character database first.
+# Unclaimed rewards are mailed after their source disappears or the server restarts.
+# Quest and unique-item eligibility are rechecked; held rewards stay in the journal.
+PersonalLoot.GenerationJournal = 0
+
+# Automatic recovery mail (requires GenerationJournal). Reloadable.
+# 0 = disabled; saved unclaimed rewards remain in the journal.
+# 1 = all eligible items (current behavior; minimum quality is ignored).
+# 2 = items at or above RecoveryMinQuality.
+# 3 = Postmaster-inspired: dungeon/raid items at or above RecoveryMinQuality;
+#     excludes quest items, bind-on-equip items, currency tokens and gold.
+# Mode 3 is a configurable approximation, not exact modern-retail behavior.
+PersonalLoot.RecoveryMode = 1
+
+# 0 poor/gray, 1 common/white, 2 uncommon/green, 3 rare/blue, 4 epic/purple,
+# 5 legendary, 6 artifact, 7 heirloom. Used by modes 2 and 3.
+PersonalLoot.RecoveryMinQuality = 3
+
+# Recover unclaimed gold in modes 1 and 2. Does not affect ordinary gold looting.
+PersonalLoot.RecoveryGold = 1
+
+# Restrict modes 1 and 2 to dungeon/raid sources. Mode 3 always uses this scope.
+PersonalLoot.RecoveryInstancesOnly = 0
+
+# Filters also apply to existing unclaimed rewards. Excluded rewards are retained,
+# so relaxing the settings later can mail them. Already sent mail is unaffected.

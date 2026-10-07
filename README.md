@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="icon.png" alt="Voxville Personal Loot treasure chest" width="160">
+</p>
+
 # Voxville Personal Loot
 
 **Independent loot for every eligible player, with optional personal gold and saved-loot recovery.**
